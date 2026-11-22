@@ -2,15 +2,51 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, ApiError, SLUG, eur, errorText, msg } from "@/lib/api";
+import { api, ApiError, EU_ALLERGENS, SLUG, eur, errorText, msg } from "@/lib/api";
 
-type Product = { id: string; name: string; description: string | null; price: string };
+type ModifierOption = {
+  id: string;
+  name: string;
+  priceDelta: string;
+  isAvailable: boolean;
+};
+
+type ModifierGroup = {
+  id: string;
+  name: string;
+  minSelections: number;
+  maxSelections: number;
+  options: ModifierOption[];
+};
+
+type Product = {
+  id: string;
+  name: string;
+  description: string | null;
+  price: string;
+  allergens?: string[];
+  isCombo?: boolean;
+  vatRate?: string;
+  modifierGroups?: { sortOrder: number; modifierGroup: ModifierGroup }[];
+};
+
 type Category = { id: string; name: string; products: Product[] };
 type Menu = {
   name: string;
   open: boolean;
+  extraPrepMinutes?: number;
   hours: { weekday: number; openMin: number; closeMin: number }[];
   categories: Category[];
+};
+
+type CartItem = {
+  key: string;
+  productId: string;
+  name: string;
+  quantity: number;
+  selectedOptionIds: string[];
+  optionNames: string[];
+  unitPrice: number;
 };
 
 type ClientOrder = {
@@ -48,22 +84,37 @@ const STATUS_ES: Record<string, string> = {
   CANCELLED: "Cancelado",
 };
 
+const ALLERGEN_MAP = new Map(EU_ALLERGENS.map((a) => [a.code, a]));
 const hhmm = (m: number) => `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 
 export default function Home() {
   const router = useRouter();
   const [menu, setMenu] = useState<Menu | null>(null);
   const [loadError, setLoadError] = useState("");
-  const [cart, setCart] = useState<Record<string, number>>({});
+  const [cart, setCart] = useState<CartItem[]>([]);
   const [f, setF] = useState({
     clientName: "", clientPhone: "", streetType: "calle", streetName: "", streetNumber: "",
     postalCode: "", floor: "", door: "", notes: "",
   });
+  const [promoCode, setPromoCode] = useState("");
   const [pay, setPay] = useState<"CARD" | "CASH">("CARD");
   const [cash, setCash] = useState("");
-  const [quote, setQuote] = useState<{ kind: "idle" | "loading" | "ok" | "error"; text: string }>({ kind: "idle", text: "" });
+  const [quote, setQuote] = useState<{
+    kind: "idle" | "loading" | "ok" | "error";
+    text: string;
+    deliveryFee?: number;
+    discountAmount?: number;
+    minOrderAmount?: number;
+  }>({ kind: "idle", text: "" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  // Modifier Modal
+  const [modModal, setModModal] = useState<{
+    product: Product;
+    selectedByGroup: Record<string, string[]>;
+    err: string;
+  } | null>(null);
 
   // Client Account State
   const [clientToken, setClientToken] = useState<string | null>(null);
@@ -155,12 +206,93 @@ export default function Home() {
     setF((p) => ({ ...p, [k]: e.target.value }));
 
   const products = useMemo(() => new Map((menu?.categories ?? []).flatMap((c) => c.products).map((p) => [p.id, p])), [menu]);
-  const items = Object.entries(cart).filter(([, q]) => q > 0);
-  const total = items.reduce((s, [id, q]) => s + Number(products.get(id)?.price ?? 0) * q, 0);
-  const count = items.reduce((s, [, q]) => s + q, 0);
-  const change = (id: string, d: number) => setCart((c) => ({ ...c, [id]: Math.max(0, Math.min(50, (c[id] ?? 0) + d)) }));
+  const subtotal = cart.reduce((s, item) => s + item.unitPrice * item.quantity, 0);
+  const count = cart.reduce((s, item) => s + item.quantity, 0);
+  const deliveryFee = quote.kind === "ok" ? (quote.deliveryFee ?? 0) : 0;
+  const discountAmount = quote.kind === "ok" ? (quote.discountAmount ?? 0) : 0;
+  const total = Math.max(0, subtotal + deliveryFee - discountAmount);
 
-  // Estimated time (and zone / opening-hours check) once the address looks complete
+  function addSimpleOrOpenModal(p: Product) {
+    const groups = p.modifierGroups ?? [];
+    if (groups.length === 0) {
+      addCartLine(p, [], [], Number(p.price));
+      return;
+    }
+    const initial: Record<string, string[]> = {};
+    for (const pmg of groups) {
+      const g = pmg.modifierGroup;
+      if (g.minSelections > 0) {
+        const avail = g.options.filter((o) => o.isAvailable);
+        initial[g.id] = avail.slice(0, g.minSelections).map((o) => o.id);
+      } else {
+        initial[g.id] = [];
+      }
+    }
+    setModModal({ product: p, selectedByGroup: initial, err: "" });
+  }
+
+  function addCartLine(p: Product, optionIds: string[], optionNames: string[], unitPrice: number) {
+    const sortedKey = `${p.id}::${[...optionIds].sort().join(",")}`;
+    setCart((prev) => {
+      const existing = prev.find((c) => c.key === sortedKey);
+      if (existing) {
+        return prev.map((c) => (c.key === sortedKey ? { ...c, quantity: Math.min(50, c.quantity + 1) } : c));
+      }
+      return [
+        ...prev,
+        {
+          key: sortedKey,
+          productId: p.id,
+          name: p.name,
+          quantity: 1,
+          selectedOptionIds: optionIds,
+          optionNames,
+          unitPrice,
+        },
+      ];
+    });
+  }
+
+  function changeCartQty(key: string, delta: number) {
+    setCart((prev) =>
+      prev
+        .map((c) => (c.key === key ? { ...c, quantity: c.quantity + delta } : c))
+        .filter((c) => c.quantity > 0)
+    );
+  }
+
+  function confirmModifierModal() {
+    if (!modModal) return;
+    const { product, selectedByGroup } = modModal;
+    const groups = product.modifierGroups ?? [];
+    const chosenIds: string[] = [];
+    const chosenNames: string[] = [];
+    let delta = 0;
+
+    for (const pmg of groups) {
+      const g = pmg.modifierGroup;
+      const sel = selectedByGroup[g.id] ?? [];
+      if (sel.length < g.minSelections || sel.length > g.maxSelections) {
+        setModModal({
+          ...modModal,
+          err: `Selecciona entre ${g.minSelections} y ${g.maxSelections} opciones en "${g.name}".`,
+        });
+        return;
+      }
+      for (const optId of sel) {
+        const opt = g.options.find((o) => o.id === optId);
+        if (opt) {
+          chosenIds.push(opt.id);
+          chosenNames.push(Number(opt.priceDelta) > 0 ? `${opt.name} (+${eur(opt.priceDelta)})` : opt.name);
+          delta += Number(opt.priceDelta);
+        }
+      }
+    }
+    addCartLine(product, chosenIds, chosenNames, Number(product.price) + delta);
+    setModModal(null);
+  }
+
+  // Estimated time + zone + promo pre-check
   useEffect(() => {
     if (!f.streetName.trim() || !f.streetNumber.trim() || !/^\d{5}$/.test(f.postalCode)) {
       setQuote({ kind: "idle", text: "" });
@@ -169,21 +301,47 @@ export default function Home() {
     let cancelled = false;
     setQuote({ kind: "loading", text: "Calculando tiempo de entrega…" });
     const t = setTimeout(() => {
-      api<{ etaMinutes: number }>(`/public/${SLUG}/quote`, {
+      api<{
+        etaMinutes: number;
+        extraPrepMinutes?: number;
+        deliveryFee: number;
+        minOrderAmount: number;
+        discountAmount: number;
+      }>(`/public/${SLUG}/quote`, {
         method: "POST",
-        body: JSON.stringify({ streetType: f.streetType, streetName: f.streetName.trim(), streetNumber: f.streetNumber.trim(), postalCode: f.postalCode }),
+        body: JSON.stringify({
+          streetType: f.streetType,
+          streetName: f.streetName.trim(),
+          streetNumber: f.streetNumber.trim(),
+          postalCode: f.postalCode,
+          ...(subtotal > 0 ? { subtotal } : {}),
+          ...(promoCode.trim() ? { promoCode: promoCode.trim() } : {}),
+        }),
       })
-        .then((r) => !cancelled && setQuote({ kind: "ok", text: `Tiempo estimado de entrega: unos ${r.etaMinutes} minutos.` }))
+        .then((r) => {
+          if (cancelled) return;
+          const parts = [`Tiempo estimado: unos ${r.etaMinutes} min`];
+          if (r.extraPrepMinutes && r.extraPrepMinutes > 0) parts.push(`(+${r.extraPrepMinutes} min hora punta)`);
+          if (r.deliveryFee > 0) parts.push(`· Envío ${eur(r.deliveryFee)}`);
+          if (r.discountAmount > 0) parts.push(`· Descuento -${eur(r.discountAmount)}`);
+          setQuote({
+            kind: "ok",
+            text: parts.join(" "),
+            deliveryFee: r.deliveryFee,
+            discountAmount: r.discountAmount,
+            minOrderAmount: r.minOrderAmount,
+          });
+        })
         .catch((e) => !cancelled && setQuote({ kind: "error", text: msg(e) }));
-    }, 700);
+    }, 600);
     return () => { cancelled = true; clearTimeout(t); };
-  }, [f.streetType, f.streetName, f.streetNumber, f.postalCode]);
+  }, [f.streetType, f.streetName, f.streetNumber, f.postalCode, subtotal, promoCode]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
     const cashNum = Number(cash.replace(",", "."));
-    if (items.length === 0) return setError("Añade al menos un producto.");
+    if (cart.length === 0) return setError("Añade al menos un producto.");
     if (pay === "CASH" && (!cashNum || cashNum < total)) return setError(errorText.CASH_AMOUNT_TOO_LOW);
     setBusy(true);
     try {
@@ -191,12 +349,25 @@ export default function Home() {
         method: "POST",
         headers: clientToken ? { Authorization: `Bearer ${clientToken}` } : undefined,
         body: JSON.stringify({
-          clientName: f.clientName.trim(), clientPhone: f.clientPhone.trim(),
-          streetType: f.streetType, streetName: f.streetName.trim(), streetNumber: f.streetNumber.trim(), postalCode: f.postalCode,
-          ...(f.floor.trim() && { floor: f.floor.trim() }), ...(f.door.trim() && { door: f.door.trim() }),
+          clientName: f.clientName.trim(),
+          clientPhone: f.clientPhone.trim(),
+          streetType: f.streetType,
+          streetName: f.streetName.trim(),
+          streetNumber: f.streetNumber.trim(),
+          postalCode: f.postalCode,
+          ...(f.floor.trim() && { floor: f.floor.trim() }),
+          ...(f.door.trim() && { door: f.door.trim() }),
           ...(f.notes.trim() && { notes: f.notes.trim() }),
-          paymentMethod: pay, ...(pay === "CASH" && { cashAmount: cashNum }),
-          items: items.map(([productId, quantity]) => ({ productId, quantity })),
+          ...(promoCode.trim() && { promoCode: promoCode.trim() }),
+          paymentMethod: pay,
+          ...(pay === "CASH" && { cashAmount: cashNum }),
+          items: cart.map((item) => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            ...(item.selectedOptionIds.length > 0 && {
+              selectedModifiers: item.selectedOptionIds.map((modifierOptionId) => ({ modifierOptionId })),
+            }),
+          })),
         }),
       });
       router.push(`/pedido/${r.trackingToken}`);
@@ -231,7 +402,10 @@ export default function Home() {
           👤 {client ? client.name : "Mi cuenta"}
         </button>
       </div>
-      <p className="muted" style={{ marginTop: 0 }}>Reparto a domicilio gratis{h ? ` · de ${hhmm(h.openMin)} a ${hhmm(h.closeMin)}` : ""}</p>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Reparto a domicilio{h ? ` · de ${hhmm(h.openMin)} a ${hhmm(h.closeMin)}` : ""}
+        {menu.extraPrepMinutes && menu.extraPrepMinutes > 0 ? ` · ⏳ Hora punta (+${menu.extraPrepMinutes} min)` : ""}
+      </p>
 
       {/* CLIENT ACCOUNT PANEL */}
       {accountOpen && (
@@ -268,8 +442,21 @@ export default function Home() {
                         <button
                           type="button"
                           onClick={() => {
-                            const nextCart: Record<string, number> = {};
-                            o.items.forEach((i) => { nextCart[i.productId] = i.quantity; });
+                            const nextCart: CartItem[] = [];
+                            o.items.forEach((i) => {
+                              const p = products.get(i.productId);
+                              if (p && (p.modifierGroups ?? []).length === 0) {
+                                nextCart.push({
+                                  key: `${i.productId}::`,
+                                  productId: i.productId,
+                                  name: i.name,
+                                  quantity: i.quantity,
+                                  selectedOptionIds: [],
+                                  optionNames: [],
+                                  unitPrice: Number(p.price),
+                                });
+                              }
+                            });
                             setCart(nextCart);
                             setAccountOpen(false);
                           }}
@@ -325,9 +512,6 @@ export default function Home() {
               <button type="submit" className="btn" style={{ marginTop: 12 }} disabled={authBusy}>
                 {authBusy ? "…" : authMode === "login" ? "Entrar en mi cuenta" : "Crear cuenta y guardar mis datos"}
               </button>
-              <p className="muted" style={{ fontSize: ".82rem", margin: "8px 0 0" }}>
-                Con tu cuenta guardamos tu dirección habitual y puedes ver el historial y seguimiento de tus pedidos.
-              </p>
             </form>
           )}
         </div>
@@ -342,25 +526,76 @@ export default function Home() {
       {menu.categories.map((c) => (
         <section key={c.id}>
           <h2>{c.name}</h2>
-          {c.products.map((p) => (
-            <div className="card product" key={p.id}>
-              <div>
-                <strong>{p.name}</strong> · {eur(p.price)}
-                {p.description && <p>{p.description}</p>}
+          {c.products.map((p) => {
+            const qtyInCart = cart.filter((ci) => ci.productId === p.id).reduce((s, ci) => s + ci.quantity, 0);
+            const hasMods = (p.modifierGroups ?? []).length > 0;
+            return (
+              <div className="card product" key={p.id}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <strong>{p.name}</strong> · {eur(p.price)}
+                    {p.isCombo && (
+                      <span style={{ fontSize: ".7rem", fontWeight: 700, padding: "2px 6px", borderRadius: 6, background: "var(--accent)", color: "var(--accent-text)" }}>
+                        COMBO
+                      </span>
+                    )}
+                    {hasMods && (
+                      <span className="muted" style={{ fontSize: ".75rem" }}>· Personalizable</span>
+                    )}
+                  </div>
+                  {p.description && <p>{p.description}</p>}
+                  {(p.allergens ?? []).length > 0 && (
+                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 4 }}>
+                      {(p.allergens ?? []).map((code) => {
+                        const a = ALLERGEN_MAP.get(code);
+                        return (
+                          <span key={code} style={{ fontSize: ".72rem", padding: "1px 6px", borderRadius: 6, border: "1px solid var(--line)", color: "var(--muted)" }}>
+                            {a ? `${a.icon} ${a.label}` : code}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div className="qty">
+                  {!hasMods && qtyInCart > 0 && (
+                    <>
+                      <button type="button" className="minus" aria-label={`Quitar ${p.name}`} onClick={() => changeCartQty(`${p.id}::`, -1)}>−</button>
+                      <span>{qtyInCart}</span>
+                    </>
+                  )}
+                  {hasMods && qtyInCart > 0 && <span>{qtyInCart}</span>}
+                  <button type="button" aria-label={`Añadir ${p.name}`} onClick={() => addSimpleOrOpenModal(p)}>+</button>
+                </div>
               </div>
-              <div className="qty">
-                {(cart[p.id] ?? 0) > 0 && (
-                  <>
-                    <button type="button" className="minus" aria-label={`Quitar ${p.name}`} onClick={() => change(p.id, -1)}>−</button>
-                    <span>{cart[p.id]}</span>
-                  </>
-                )}
-                <button type="button" aria-label={`Añadir ${p.name}`} onClick={() => change(p.id, 1)}>+</button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </section>
       ))}
+
+      {/* CART SUMMARY */}
+      {cart.length > 0 && (
+        <section>
+          <h2>Tu carrito</h2>
+          <div className="card">
+            {cart.map((item) => (
+              <div key={item.key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "1px solid var(--line)" }}>
+                <div>
+                  <strong>{item.quantity}× {item.name}</strong> · {eur(item.unitPrice * item.quantity)}
+                  {item.optionNames.length > 0 && (
+                    <div className="muted" style={{ fontSize: ".82rem" }}>{item.optionNames.join(", ")}</div>
+                  )}
+                </div>
+                <div className="qty">
+                  <button type="button" className="minus" onClick={() => changeCartQty(item.key, -1)}>−</button>
+                  <span>{item.quantity}</span>
+                  <button type="button" onClick={() => changeCartQty(item.key, 1)}>+</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <form onSubmit={submit} id="checkout">
         <h2>Tus datos</h2>
@@ -394,6 +629,8 @@ export default function Home() {
           </div>
           <label htmlFor="nt">Notas para el repartidor (opcional)</label>
           <textarea id="nt" rows={2} maxLength={500} value={f.notes} onChange={set("notes")} placeholder="Ej.: llámame al llegar / no llames al timbre, hay un bebé" />
+          <label htmlFor="promo">Código promocional (opcional)</label>
+          <input id="promo" value={promoCode} onChange={(e) => setPromoCode(e.target.value.toUpperCase())} placeholder="Ej.: BIENVENIDA" />
         </div>
         {quote.kind !== "idle" && <div className={`banner ${quote.kind === "ok" ? "ok" : quote.kind === "error" ? "error" : ""}`}>{quote.text}</div>}
 
@@ -420,6 +657,83 @@ export default function Home() {
           </div>
         </div>
       </form>
+
+      {/* MODIFIER SELECTOR MODAL */}
+      {modModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 60 }}>
+          <div className="card" style={{ maxWidth: 460, width: "100%", maxHeight: "85vh", overflowY: "auto", padding: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid var(--line)", paddingBottom: 8 }}>
+              <strong>{modModal.product.name} · {eur(modModal.product.price)}</strong>
+              <button type="button" onClick={() => setModModal(null)} style={{ border: 0, background: "none", fontSize: "1.2rem", cursor: "pointer", color: "var(--text)" }}>✕</button>
+            </div>
+            {(modModal.product.modifierGroups ?? []).map((pmg, idx) => {
+              const g = pmg.modifierGroup;
+              const sel = modModal.selectedByGroup[g.id] ?? [];
+              const isRadio = g.maxSelections === 1;
+              return (
+                <div key={g.id} style={{ marginTop: 12 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                    {modModal.product.isCombo ? `Paso ${idx + 1}: ` : ""}{g.name}{" "}
+                    <span className="muted" style={{ fontSize: ".8rem", fontWeight: 400 }}>
+                      ({g.minSelections > 0 ? `Obligatorio · mín. ${g.minSelections}` : "Opcional"}, máx. {g.maxSelections})
+                    </span>
+                  </div>
+                  {g.options.map((opt) => {
+                    const checked = sel.includes(opt.id);
+                    return (
+                      <label
+                        key={opt.id}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          padding: "8px 10px",
+                          border: "1px solid var(--line)",
+                          borderRadius: 8,
+                          margin: "4px 0",
+                          opacity: opt.isAvailable ? 1 : 0.45,
+                          color: "var(--text)",
+                        }}
+                      >
+                        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <input
+                            type={isRadio ? "radio" : "checkbox"}
+                            disabled={!opt.isAvailable}
+                            checked={checked}
+                            style={{ width: "auto" }}
+                            onChange={() => {
+                              setModModal((prev) => {
+                                if (!prev) return null;
+                                const cur = prev.selectedByGroup[g.id] ?? [];
+                                let next: string[];
+                                if (isRadio) {
+                                  next = [opt.id];
+                                } else if (cur.includes(opt.id)) {
+                                  next = cur.filter((x) => x !== opt.id);
+                                } else {
+                                  if (cur.length >= g.maxSelections) return prev;
+                                  next = [...cur, opt.id];
+                                }
+                                return { ...prev, err: "", selectedByGroup: { ...prev.selectedByGroup, [g.id]: next } };
+                              });
+                            }}
+                          />
+                          {opt.name} {!opt.isAvailable ? "(Agotado)" : ""}
+                        </span>
+                        <span>{Number(opt.priceDelta) > 0 ? `+${eur(opt.priceDelta)}` : "Incluido"}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              );
+            })}
+            {modModal.err && <div className="banner error">{modModal.err}</div>}
+            <button type="button" className="btn" style={{ marginTop: 14 }} onClick={confirmModifierModal}>
+              Añadir al carrito
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

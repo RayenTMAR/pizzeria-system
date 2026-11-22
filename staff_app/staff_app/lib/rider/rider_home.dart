@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -10,7 +11,14 @@ import '../ratings.dart';
 class RiderHome extends StatefulWidget {
   final String name;
   final VoidCallback onLogout;
-  const RiderHome({super.key, required this.name, required this.onLogout});
+  // In production on device, pass a callback backed by geolocator.
+  final Future<Map<String, double>?> Function()? locationProvider;
+  const RiderHome({
+    super.key,
+    required this.name,
+    required this.onLogout,
+    this.locationProvider,
+  });
   @override
   State<RiderHome> createState() => _RiderHomeState();
 }
@@ -20,6 +28,9 @@ class _RiderHomeState extends State<RiderHome> with Polling {
   List<dynamic> orders = [];
   Map? summary;
   Set<String>? seen;
+  Timer? _gpsTimer;
+  Timer? _countdownTimer;
+  DateTime _now = DateTime.now();
 
   @override
   void initState() {
@@ -27,7 +38,58 @@ class _RiderHomeState extends State<RiderHome> with Polling {
     startPolling();
   }
 
+  @override
+  void dispose() {
+    _gpsTimer?.cancel();
+    _countdownTimer?.cancel();
+    super.dispose();
+  }
+
   String get status => shift['onShift'] == true ? shift['status'] as String : 'OFF';
+
+  void _syncTimers() {
+    if (status == 'DELIVERING' && orders.isNotEmpty) {
+      if (_gpsTimer == null) {
+        _sendGps();
+        _gpsTimer = Timer.periodic(const Duration(seconds: 15), (_) => _sendGps());
+      }
+    } else {
+      _gpsTimer?.cancel();
+      _gpsTimer = null;
+    }
+
+    final hasUnreachable = orders.any((o) => o['unreachableStartedAt'] != null && o['status'] == 'ON_THE_WAY');
+    if (hasUnreachable) {
+      _countdownTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() => _now = DateTime.now());
+      });
+    } else {
+      _countdownTimer?.cancel();
+      _countdownTimer = null;
+    }
+  }
+
+  Future<void> _sendGps() async {
+    if (status != 'DELIVERING' || orders.isEmpty) {
+      _gpsTimer?.cancel();
+      _gpsTimer = null;
+      return;
+    }
+    try {
+      Map<String, double>? coords =
+          widget.locationProvider != null ? await widget.locationProvider!() : null;
+      if (coords == null) {
+        final first = orders.first as Map;
+        final lat = (first['destLat'] as num?)?.toDouble() ?? 40.4168;
+        final lng = (first['destLng'] as num?)?.toDouble() ?? -3.7038;
+        coords = {'lat': lat, 'lng': lng};
+      }
+      await Api.patch('/staff/riders/me/location', {
+        'lat': coords['lat'],
+        'lng': coords['lng'],
+      });
+    } catch (_) {}
+  }
 
   @override
   Future<void> refresh() async {
@@ -39,8 +101,36 @@ class _RiderHomeState extends State<RiderHome> with Polling {
       // Sound when a new order is assigned to me
       if (seen != null && o.any((x) => !seen!.contains(x['id']))) alertSound();
       seen = o.map((x) => x['id'] as String).toSet();
-      if (mounted) setState(() { shift = s; orders = o; summary = sum; });
+      if (mounted) {
+        setState(() {
+          shift = s;
+          orders = o;
+          summary = sum;
+          _now = DateTime.now();
+        });
+        _syncTimers();
+      }
     } catch (_) {}
+  }
+
+  Future<void> _markUnreachable(Map o) async {
+    try {
+      await Api.post('/orders/${o['id']}/unreachable');
+      await refresh();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _returnToStore(Map o) async {
+    final ok = await confirm(context, tr('returnStoreBtn'), '#${o['number']} · ${o['clientName']}');
+    if (!ok) return;
+    try {
+      await Api.post('/orders/${o['id']}/unreachable-return');
+      await refresh();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
   }
 
   Future<void> _ready() async {
@@ -146,6 +236,20 @@ class _RiderHomeState extends State<RiderHome> with Polling {
   Widget _orderCard(Map o) {
     final address = addressLine(o);
     final mapAddress = '${o['streetType']} ${o['streetName']} ${o['streetNumber']}, ${o['postalCode']}';
+    final itemsLines = ((o['items'] as List?) ?? []).map((i) {
+      final mods = ((i['modifiers'] as List?) ?? []).cast<Map>();
+      final modStr = mods.isEmpty ? '' : '\n   + ${mods.map((m) => m['optionName']).join(', ')}';
+      return '${i['quantity']}× ${i['name']}$modStr';
+    }).join('\n');
+
+    final unreachRaw = o['unreachableStartedAt'];
+    int? remainingSec;
+    if (unreachRaw != null) {
+      final started = DateTime.tryParse(unreachRaw.toString());
+      final elapsed = started != null ? _now.difference(started).inSeconds : 0;
+      remainingSec = (300 - elapsed).clamp(0, 300).toInt();
+    }
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -177,9 +281,25 @@ class _RiderHomeState extends State<RiderHome> with Polling {
               ),
             ]),
           ),
+          if (itemsLines.isNotEmpty) Text(itemsLines),
           Text('${tr('total')} ${eur(o['total'])} · ${payLine(o)}', style: const TextStyle(fontWeight: FontWeight.w600)),
           if ((o['notes'] ?? '').toString().isNotEmpty)
             Text('${tr('notes')}: ${o['notes']}', style: const TextStyle(fontStyle: FontStyle.italic)),
+          if (remainingSec != null) ...[
+            const SizedBox(height: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade50,
+                border: Border.all(color: Colors.orange.shade300),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                '⏱ ${tr('wait5Min')} · ${(remainingSec ~/ 60).toString().padLeft(2, '0')}:${(remainingSec % 60).toString().padLeft(2, '0')}',
+                style: const TextStyle(color: Colors.deepOrange, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           Wrap(spacing: 8, children: [
             OutlinedButton.icon(
@@ -206,7 +326,24 @@ class _RiderHomeState extends State<RiderHome> with Polling {
                 myRole: 'REPARTIDOR',
               ),
             ),
+            if (remainingSec == null)
+              OutlinedButton.icon(
+                icon: const Icon(Icons.timer_outlined),
+                label: Text(tr('unreachableBtn')),
+                onPressed: () => _markUnreachable(o),
+              ),
           ]),
+          if (remainingSec == 0) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonalIcon(
+                icon: const Icon(Icons.assignment_return_outlined),
+                label: Text(tr('returnStoreBtn')),
+                onPressed: () => _returnToStore(o),
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           SizedBox(
             width: double.infinity,
@@ -308,7 +445,16 @@ class _RiderHomeState extends State<RiderHome> with Polling {
                 color: _statusColor(context),
                 child: Padding(
                   padding: const EdgeInsets.all(16),
-                  child: Text(tr('status.$status'), style: Theme.of(context).textTheme.titleLarge),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(tr('status.$status'), style: Theme.of(context).textTheme.titleLarge),
+                    if (status == 'DELIVERING') ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        '📍 ${tr('gpsActive')}',
+                        style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.black87),
+                      ),
+                    ],
+                  ]),
                 ),
               ),
               // Only visible while coming back to the restaurant

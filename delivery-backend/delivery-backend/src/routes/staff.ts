@@ -11,9 +11,11 @@ import {
   logEvent,
   updateAddress,
   addressFields,
+  addressString,
 } from "../orders";
-import { workingDayStart } from "../rules";
-import { pushToUsers } from "../push";
+import { optimizeMultiStopRoute } from "../maps";
+import { workingDayStart, localParts } from "../rules";
+import { pushToUsers, pushToJefes } from "../push";
 
 export const staff = Router();
 const MAX_PER_TRIP = 4;
@@ -67,6 +69,31 @@ async function refreshRider(userId: string, restaurantId: string) {
 const riderStatus = (shift: { comingBack: boolean }, active: number) =>
   active > 0 ? "DELIVERING" : shift.comingBack ? "COMING_BACK" : "AVAILABLE";
 
+/** Optimizes stopNumber (1..N) across a rider's active ON_THE_WAY orders. */
+async function optimizeRiderStops(restaurantId: string, repartidorId: string): Promise<string[]> {
+  const active = await prisma.order.findMany({
+    where: { restaurantId, repartidorId, status: "ON_THE_WAY" },
+    orderBy: [{ stopNumber: "asc" }, { createdAt: "asc" }],
+  });
+  if (active.length < 2) return active.map((o) => o.id);
+  const settings = await prisma.restaurantSettings.findUniqueOrThrow({ where: { restaurantId } });
+  const orderedIds = await optimizeMultiStopRoute(
+    { lat: settings.lat, lng: settings.lng },
+    active.map((o) => ({
+      id: o.id,
+      address: addressString(o, settings.city),
+      lat: o.destLat,
+      lng: o.destLng,
+    }))
+  );
+  await prisma.$transaction(
+    orderedIds.map((id, idx) =>
+      prisma.order.update({ where: { id }, data: { stopNumber: idx + 1 } })
+    )
+  );
+  return orderedIds;
+}
+
 // ---------- Orders ----------
 /** Today's orders (day resets at dayResetHour). Riders only see their own active trip. */
 staff.get("/orders", requireRole("JEFE", "REPARTIDOR"), async (req, res) => {
@@ -75,6 +102,33 @@ staff.get("/orders", requireRole("JEFE", "REPARTIDOR"), async (req, res) => {
     where: { id: u.restaurantId },
     include: { settings: true },
   });
+
+  // CloudPRNT unprinted job watchdog (> 60 seconds in IN_KITCHEN without printing)
+  if (u.role === "JEFE") {
+    const cutoff = new Date(Date.now() - 60_000);
+    const staleUnprinted = await prisma.order.findMany({
+      where: {
+        restaurantId: u.restaurantId,
+        status: "IN_KITCHEN",
+        printedAt: null,
+        printFailed: false,
+        createdAt: { lt: cutoff },
+      },
+      select: { id: true, number: true },
+    });
+    if (staleUnprinted.length > 0) {
+      await prisma.order.updateMany({
+        where: { id: { in: staleUnprinted.map((o) => o.id) } },
+        data: { printFailed: true },
+      });
+      pushToJefes(u.restaurantId, () => ({
+        title: "¡Alerta de impresora!",
+        body: `Pedido(s) #${staleUnprinted.map((o) => o.number).join(", #")} sin imprimir`,
+        data: { type: "PRINT_FAILED" },
+      })).catch(() => {});
+    }
+  }
+
   const from = workingDayStart(new Date(), r.timezone, r.settings?.dayResetHour ?? 2);
   const where: Prisma.OrderWhereInput = { restaurantId: u.restaurantId, createdAt: { gte: from } };
   if (u.role === "REPARTIDOR") {
@@ -85,7 +139,10 @@ staff.get("/orders", requireRole("JEFE", "REPARTIDOR"), async (req, res) => {
     await prisma.order.findMany({
       where,
       orderBy: u.role === "REPARTIDOR" ? { stopNumber: "asc" } : { createdAt: "asc" },
-      include: { items: true, repartidor: { select: { id: true, name: true } } },
+      include: {
+        items: { include: { modifiers: true } },
+        repartidor: { select: { id: true, name: true } },
+      },
     })
   );
 });
@@ -149,6 +206,9 @@ staff.post("/orders/:id/assign", requireRole("JEFE"), async (req, res) => {
     from: previous,
     to: repartidorId,
   });
+  if (current + 1 >= 2) {
+    await optimizeRiderStops(rid(req), repartidorId);
+  }
   if (previous && previous !== repartidorId) await refreshRider(previous, rid(req));
   const where = `${o.streetType} ${o.streetName} ${o.streetNumber}`;
   pushToUsers([repartidorId], (lang) => ({
@@ -192,7 +252,108 @@ staff.patch("/orders/:id/address", requireRole("JEFE", "REPARTIDOR"), async (req
 
 staff.post("/orders/:id/reprint", requireRole("JEFE"), async (req, res) => {
   const o = await getOrder(req, param(req, "id"));
-  await prisma.order.update({ where: { id: o.id }, data: { printedAt: null } });
+  await prisma.order.update({ where: { id: o.id }, data: { printedAt: null, printFailed: false } });
+  res.json({ ok: true });
+});
+
+/** Unreachable customer timer: starts 5-min countdown, alerts Jefe, notifies customer chat. */
+staff.post("/orders/:id/unreachable", requireRole("JEFE", "REPARTIDOR"), async (req, res) => {
+  const o = await getOrder(req, param(req, "id"));
+  if (o.status !== "ON_THE_WAY") throw new OrderError("INVALID_STATUS");
+  if (req.user!.role === "REPARTIDOR" && o.repartidorId !== req.user!.id)
+    throw new OrderError("NOT_YOUR_ORDER", 403);
+  const startedAt = o.unreachableStartedAt ?? new Date();
+  if (!o.unreachableStartedAt) {
+    await prisma.order.update({
+      where: { id: o.id },
+      data: { unreachableStartedAt: startedAt },
+    });
+    await logEvent(o.id, "UNREACHABLE_ATTEMPT", req.user!.id);
+    await prisma.chatMessage.create({
+      data: {
+        restaurantId: rid(req),
+        channel: "RIDER_CLIENT",
+        orderId: o.id,
+        senderRole: "REPARTIDOR",
+        senderName: "Repartidor",
+        text: "Tu repartidor está en la puerta y no logra contactar contigo. Por favor, responde en los próximos 5 minutos.",
+      },
+    });
+    pushToJefes(rid(req), () => ({
+      title: `¡Cliente no contesta! Pedido #${o.number}`,
+      body: `${o.clientName} (${o.clientPhone}) no responde en la puerta.`,
+      data: { type: "UNREACHABLE", orderId: o.id },
+    })).catch(() => {});
+  }
+  res.json({ ok: true, unreachableStartedAt: startedAt });
+});
+
+/** After 5 minutes (or immediately by Jefe), mark unreachable order returned to store. */
+staff.post("/orders/:id/unreachable-return", requireRole("JEFE", "REPARTIDOR"), async (req, res) => {
+  const o = await getOrder(req, param(req, "id"));
+  if (o.status !== "ON_THE_WAY") throw new OrderError("INVALID_STATUS");
+  if (req.user!.role === "REPARTIDOR") {
+    if (o.repartidorId !== req.user!.id) throw new OrderError("NOT_YOUR_ORDER", 403);
+    if (!o.unreachableStartedAt || Date.now() - o.unreachableStartedAt.getTime() < 5 * 60_000) {
+      throw new OrderError("WAIT_5_MINUTES");
+    }
+  }
+  await prisma.order.update({
+    where: { id: o.id },
+    data: {
+      status: "CANCELLED",
+      cancelReason: "Incidencia: cliente no contesta (devuelto a tienda)",
+      cancelledById: req.user!.id,
+    },
+  });
+  await logEvent(o.id, "UNREACHABLE_RETURN", req.user!.id);
+  if (o.repartidorId) await refreshRider(o.repartidorId, rid(req));
+  res.json({ ok: true });
+});
+
+/** Optimize stop order (2-4 active orders) for a rider using Google Routes API / fallback. */
+staff.post("/staff/riders/:riderId/optimize-route", requireRole("JEFE"), async (req, res) => {
+  const riderId = param(req, "riderId");
+  const stopOrder = await optimizeRiderStops(rid(req), riderId);
+  if (stopOrder.length >= 2) {
+    pushToUsers([riderId], (lang) => ({
+      title: lang === "en" ? "Route updated" : "Ruta optimizada",
+      body: lang === "en" ? "Your delivery stops have been reordered" : "Se ha calculado el orden óptimo de tus paradas",
+      data: { type: "ROUTE_OPTIMIZED" },
+    })).catch(() => {});
+  }
+  res.json({ ok: true, stopOrder });
+});
+
+/** Manual stop reorder fallback by the Jefe. */
+staff.post("/staff/riders/:riderId/reorder-stops", requireRole("JEFE"), async (req, res) => {
+  const riderId = param(req, "riderId");
+  const { orderIds } = z.object({ orderIds: z.array(z.string().uuid()).min(1) }).parse(req.body);
+  const active = await prisma.order.findMany({
+    where: { restaurantId: rid(req), repartidorId: riderId, status: "ON_THE_WAY" },
+    select: { id: true },
+  });
+  const activeSet = new Set(active.map((o) => o.id));
+  if (orderIds.some((id) => !activeSet.has(id))) throw new OrderError("INVALID_STATUS");
+  await prisma.$transaction(
+    orderIds.map((id, idx) =>
+      prisma.order.update({ where: { id }, data: { stopNumber: idx + 1 } })
+    )
+  );
+  res.json({ ok: true, stopOrder: orderIds });
+});
+
+/** Throttled live GPS update sent by Repartidor while status is DELIVERING. */
+staff.patch("/staff/riders/me/location", requireRole("REPARTIDOR"), async (req, res) => {
+  const { lat, lng } = z
+    .object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) })
+    .parse(req.body);
+  const active = await activeCount(req.user!.id, rid(req));
+  if (active === 0) return res.json({ ok: false, stopped: true });
+  await prisma.user.update({
+    where: { id: req.user!.id },
+    data: { lastLat: lat, lastLng: lng, lastLocationAt: new Date() },
+  });
   res.json({ ok: true });
 });
 
@@ -451,7 +612,86 @@ staff.patch("/staff/riders/:id", requireRole("JEFE"), async (req, res) => {
   );
 });
 
-/** Jefe: menu for manual orders (available products only, or all products when ?all=1). */
+/** Jefe: restaurant operational status (rush mode, printer watchdog, unprinted alerts, fiscal config). */
+staff.get("/staff/restaurant/status", requireRole("JEFE"), async (req, res) => {
+  const r = await prisma.restaurant.findUniqueOrThrow({
+    where: { id: rid(req) },
+    include: { hours: true, printers: { where: { active: true } } },
+  });
+  const { weekday, minutes } = localParts(new Date(), r.timezone);
+  const open = r.hours.some((h) => h.weekday === weekday && minutes >= h.openMin && minutes < h.closeMin);
+  const lastPoll = r.lastPrinterPollAt ?? r.printers[0]?.lastSeenAt ?? null;
+  const printerOffline = open && (!lastPoll || Date.now() - lastPoll.getTime() > 45_000);
+  const unprintedCutoff = new Date(Date.now() - 60_000);
+  const unprintedAlerts = await prisma.order.findMany({
+    where: {
+      restaurantId: rid(req),
+      status: "IN_KITCHEN",
+      printedAt: null,
+      createdAt: { lt: unprintedCutoff },
+    },
+    select: { id: true, number: true, createdAt: true },
+    orderBy: { createdAt: "asc" },
+  });
+  res.json({
+    extraPrepMinutes: r.extraPrepMinutes,
+    open,
+    lastPrinterPollAt: lastPoll,
+    printerOffline,
+    unprintedAlerts,
+    legalName: r.legalName,
+    nifCif: r.nifCif,
+    fiscalAddress: r.fiscalAddress,
+    defaultVatRate: Number(r.defaultVatRate),
+    printCustomerReceipt: r.printCustomerReceipt,
+  });
+});
+
+/** Jefe: toggle dynamic rush mode delay (+0 / +15 / +30 min). */
+staff.patch("/staff/restaurant/prep-delay", requireRole("JEFE"), async (req, res) => {
+  const { extraPrepMinutes } = z
+    .object({ extraPrepMinutes: z.number().int().min(0).max(120) })
+    .parse(req.body);
+  const updated = await prisma.restaurant.update({
+    where: { id: rid(req) },
+    data: { extraPrepMinutes },
+    select: { extraPrepMinutes: true },
+  });
+  res.json(updated);
+});
+
+/** Jefe: update Spanish fiscal configuration (legalName, nifCif, fiscalAddress, defaultVatRate, printCustomerReceipt). */
+staff.patch("/staff/restaurant/fiscal", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      legalName: z.string().min(1).optional(),
+      nifCif: z.string().min(1).optional(),
+      fiscalAddress: z.string().min(1).optional(),
+      defaultVatRate: z.number().min(0).max(100).optional(),
+      printCustomerReceipt: z.boolean().optional(),
+    })
+    .parse(req.body);
+  const updated = await prisma.restaurant.update({
+    where: { id: rid(req) },
+    data: {
+      ...(body.legalName !== undefined ? { legalName: body.legalName.trim() } : {}),
+      ...(body.nifCif !== undefined ? { nifCif: body.nifCif.trim().toUpperCase() } : {}),
+      ...(body.fiscalAddress !== undefined ? { fiscalAddress: body.fiscalAddress.trim() } : {}),
+      ...(body.defaultVatRate !== undefined ? { defaultVatRate: body.defaultVatRate } : {}),
+      ...(body.printCustomerReceipt !== undefined ? { printCustomerReceipt: body.printCustomerReceipt } : {}),
+    },
+    select: {
+      legalName: true,
+      nifCif: true,
+      fiscalAddress: true,
+      defaultVatRate: true,
+      printCustomerReceipt: true,
+    },
+  });
+  res.json(updated);
+});
+
+/** Jefe: menu for manual orders and menu editor (available products only, or all when ?all=1). */
 staff.post("/restaurant/hours", requireRole("JEFE"), async (req, res) => {
   const { openMin, closeMin } = z
     .object({ openMin: z.number().int().min(0).max(1440), closeMin: z.number().int().min(0).max(1440) })
@@ -473,10 +713,154 @@ staff.get("/menu", requireRole("JEFE"), async (req, res) => {
         products: {
           ...(all ? {} : { where: { available: true } }),
           orderBy: { name: "asc" },
+          include: {
+            modifierGroups: {
+              orderBy: { sortOrder: "asc" },
+              include: {
+                modifierGroup: {
+                  include: { options: { orderBy: { sortOrder: "asc" } } },
+                },
+              },
+            },
+          },
         },
       },
     })
   );
+});
+
+/** Jefe: modifier groups & options management. */
+staff.get("/menu/modifier-groups", requireRole("JEFE"), async (req, res) => {
+  res.json(
+    await prisma.modifierGroup.findMany({
+      where: { restaurantId: rid(req) },
+      orderBy: { sortOrder: "asc" },
+      include: { options: { orderBy: { sortOrder: "asc" } } },
+    })
+  );
+});
+
+staff.post("/menu/modifier-groups", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(1),
+      minSelections: z.number().int().min(0).default(0),
+      maxSelections: z.number().int().min(1).default(1),
+      sortOrder: z.number().int().optional(),
+    })
+    .parse(req.body);
+  const count = await prisma.modifierGroup.count({ where: { restaurantId: rid(req) } });
+  res.status(201).json(
+    await prisma.modifierGroup.create({
+      data: {
+        restaurantId: rid(req),
+        name: body.name.trim(),
+        minSelections: body.minSelections,
+        maxSelections: Math.max(body.minSelections, body.maxSelections),
+        sortOrder: body.sortOrder ?? count,
+      },
+      include: { options: true },
+    })
+  );
+});
+
+staff.patch("/menu/modifier-groups/:id", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(1).optional(),
+      minSelections: z.number().int().min(0).optional(),
+      maxSelections: z.number().int().min(1).optional(),
+      sortOrder: z.number().int().optional(),
+    })
+    .parse(req.body);
+  const g = await prisma.modifierGroup.findFirst({
+    where: { id: param(req, "id"), restaurantId: rid(req) },
+  });
+  if (!g) throw new OrderError("NOT_FOUND", 404);
+  res.json(
+    await prisma.modifierGroup.update({
+      where: { id: g.id },
+      data: {
+        ...(body.name !== undefined ? { name: body.name.trim() } : {}),
+        ...(body.minSelections !== undefined ? { minSelections: body.minSelections } : {}),
+        ...(body.maxSelections !== undefined ? { maxSelections: body.maxSelections } : {}),
+        ...(body.sortOrder !== undefined ? { sortOrder: body.sortOrder } : {}),
+      },
+      include: { options: { orderBy: { sortOrder: "asc" } } },
+    })
+  );
+});
+
+staff.delete("/menu/modifier-groups/:id", requireRole("JEFE"), async (req, res) => {
+  const g = await prisma.modifierGroup.findFirst({
+    where: { id: param(req, "id"), restaurantId: rid(req) },
+  });
+  if (!g) throw new OrderError("NOT_FOUND", 404);
+  await prisma.modifierGroup.delete({ where: { id: g.id } });
+  res.json({ ok: true });
+});
+
+staff.post("/menu/modifier-options", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      modifierGroupId: z.string().uuid(),
+      name: z.string().min(1),
+      priceDelta: z.number().default(0),
+      isAvailable: z.boolean().optional(),
+      sortOrder: z.number().int().optional(),
+    })
+    .parse(req.body);
+  const g = await prisma.modifierGroup.findFirst({
+    where: { id: body.modifierGroupId, restaurantId: rid(req) },
+  });
+  if (!g) throw new OrderError("NOT_FOUND", 404);
+  const count = await prisma.modifierOption.count({ where: { modifierGroupId: g.id } });
+  res.status(201).json(
+    await prisma.modifierOption.create({
+      data: {
+        modifierGroupId: g.id,
+        name: body.name.trim(),
+        priceDelta: body.priceDelta,
+        isAvailable: body.isAvailable ?? true,
+        sortOrder: body.sortOrder ?? count,
+      },
+    })
+  );
+});
+
+staff.patch("/menu/modifier-options/:id", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(1).optional(),
+      priceDelta: z.number().optional(),
+      isAvailable: z.boolean().optional(),
+      sortOrder: z.number().int().optional(),
+    })
+    .parse(req.body);
+  const opt = await prisma.modifierOption.findFirst({
+    where: { id: param(req, "id"), modifierGroup: { restaurantId: rid(req) } },
+  });
+  if (!opt) throw new OrderError("NOT_FOUND", 404);
+  res.json(
+    await prisma.modifierOption.update({
+      where: { id: opt.id },
+      data: {
+        ...(body.name !== undefined ? { name: body.name.trim() } : {}),
+        ...(body.priceDelta !== undefined ? { priceDelta: body.priceDelta } : {}),
+        ...(body.isAvailable !== undefined ? { isAvailable: body.isAvailable } : {}),
+        ...(body.sortOrder !== undefined ? { sortOrder: body.sortOrder } : {}),
+      },
+    })
+  );
+});
+
+staff.delete("/menu/modifier-options/:id", requireRole("JEFE"), async (req, res) => {
+  const opt = await prisma.modifierOption.findFirst({
+    where: { id: param(req, "id"), modifierGroup: { restaurantId: rid(req) } },
+  });
+  if (!opt) throw new OrderError("NOT_FOUND", 404);
+  await prisma.modifierOption.delete({ where: { id: opt.id } });
+  res.json({ ok: true });
 });
 
 /** Jefe: create a menu category. */
@@ -527,7 +911,7 @@ staff.delete("/menu/categories/:id", requireRole("JEFE"), async (req, res) => {
   res.json({ ok: true });
 });
 
-/** Jefe: create a product inside a category. */
+/** Jefe: create a product inside a category (with allergens, combo flag, VAT rate, modifier groups). */
 staff.post("/menu/products", requireRole("JEFE"), async (req, res) => {
   const body = z
     .object({
@@ -536,12 +920,26 @@ staff.post("/menu/products", requireRole("JEFE"), async (req, res) => {
       description: z.string().optional(),
       price: z.number().nonnegative(),
       available: z.boolean().optional(),
+      allergens: z.array(z.string()).optional(),
+      isCombo: z.boolean().optional(),
+      vatRate: z.number().min(0).max(100).optional(),
+      modifierGroupIds: z.array(z.string().uuid()).optional(),
     })
     .parse(req.body);
   const cat = await prisma.category.findFirst({
     where: { id: body.categoryId, restaurantId: rid(req) },
   });
   if (!cat) throw new OrderError("NOT_FOUND", 404);
+
+  const validGroupIds = body.modifierGroupIds?.length
+    ? (
+        await prisma.modifierGroup.findMany({
+          where: { id: { in: body.modifierGroupIds }, restaurantId: rid(req) },
+          select: { id: true },
+        })
+      ).map((g) => g.id)
+    : [];
+
   res.status(201).json(
     await prisma.product.create({
       data: {
@@ -551,12 +949,28 @@ staff.post("/menu/products", requireRole("JEFE"), async (req, res) => {
         description: body.description?.trim() || null,
         price: body.price,
         available: body.available ?? true,
+        allergens: body.allergens ?? [],
+        isCombo: body.isCombo ?? false,
+        vatRate: body.vatRate ?? 10.0,
+        ...(validGroupIds.length
+          ? {
+              modifierGroups: {
+                create: validGroupIds.map((modifierGroupId, sortOrder) => ({
+                  modifierGroupId,
+                  sortOrder,
+                })),
+              },
+            }
+          : {}),
+      },
+      include: {
+        modifierGroups: { include: { modifierGroup: { include: { options: true } } } },
       },
     })
   );
 });
 
-/** Jefe: edit a product's name, description, price, category, or availability. */
+/** Jefe: edit a product's name, description, price, category, availability, allergens, combo, VAT, modifiers. */
 staff.patch("/menu/products/:id", requireRole("JEFE"), async (req, res) => {
   const body = z
     .object({
@@ -565,12 +979,38 @@ staff.patch("/menu/products/:id", requireRole("JEFE"), async (req, res) => {
       description: z.string().optional(),
       price: z.number().nonnegative().optional(),
       available: z.boolean().optional(),
+      allergens: z.array(z.string()).optional(),
+      isCombo: z.boolean().optional(),
+      vatRate: z.number().min(0).max(100).optional(),
+      modifierGroupIds: z.array(z.string().uuid()).optional(),
     })
     .parse(req.body);
   const prod = await prisma.product.findFirst({
     where: { id: param(req, "id"), restaurantId: rid(req) },
   });
   if (!prod) throw new OrderError("NOT_FOUND", 404);
+
+  if (body.modifierGroupIds !== undefined) {
+    const validGroups = body.modifierGroupIds.length
+      ? await prisma.modifierGroup.findMany({
+          where: { id: { in: body.modifierGroupIds }, restaurantId: rid(req) },
+          select: { id: true },
+        })
+      : [];
+    const validSet = new Set(validGroups.map((g) => g.id));
+    const orderedValid = body.modifierGroupIds.filter((id) => validSet.has(id));
+    await prisma.productModifierGroup.deleteMany({ where: { productId: prod.id } });
+    if (orderedValid.length > 0) {
+      await prisma.productModifierGroup.createMany({
+        data: orderedValid.map((modifierGroupId, sortOrder) => ({
+          productId: prod.id,
+          modifierGroupId,
+          sortOrder,
+        })),
+      });
+    }
+  }
+
   res.json(
     await prisma.product.update({
       where: { id: prod.id },
@@ -580,6 +1020,12 @@ staff.patch("/menu/products/:id", requireRole("JEFE"), async (req, res) => {
         ...(body.description !== undefined ? { description: body.description.trim() || null } : {}),
         ...(body.price !== undefined ? { price: body.price } : {}),
         ...(body.available !== undefined ? { available: body.available } : {}),
+        ...(body.allergens !== undefined ? { allergens: body.allergens } : {}),
+        ...(body.isCombo !== undefined ? { isCombo: body.isCombo } : {}),
+        ...(body.vatRate !== undefined ? { vatRate: body.vatRate } : {}),
+      },
+      include: {
+        modifierGroups: { include: { modifierGroup: { include: { options: true } } } },
       },
     })
   );
@@ -601,6 +1047,189 @@ staff.delete("/menu/products/:id", requireRole("JEFE"), async (req, res) => {
     await prisma.product.delete({ where: { id: prod.id } });
   }
   res.json({ ok: true });
+});
+
+// ---------- Tiered Delivery Zones & Promo Codes ----------
+staff.get("/staff/zones", requireRole("JEFE"), async (req, res) => {
+  res.json(
+    await prisma.deliveryZone.findMany({
+      where: { restaurantId: rid(req) },
+      orderBy: { minKm: "asc" },
+    })
+  );
+});
+
+staff.post("/staff/zones", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(1),
+      minKm: z.number().min(0).default(0),
+      maxKm: z.number().positive(),
+      deliveryFee: z.number().min(0).default(0),
+      minOrderAmount: z.number().min(0).default(0),
+      isActive: z.boolean().optional(),
+    })
+    .parse(req.body);
+  res.status(201).json(
+    await prisma.deliveryZone.create({
+      data: {
+        restaurantId: rid(req),
+        name: body.name.trim(),
+        minKm: body.minKm,
+        maxKm: body.maxKm,
+        deliveryFee: body.deliveryFee,
+        minOrderAmount: body.minOrderAmount,
+        isActive: body.isActive ?? true,
+      },
+    })
+  );
+});
+
+staff.delete("/staff/zones/:id", requireRole("JEFE"), async (req, res) => {
+  const zRow = await prisma.deliveryZone.findFirst({
+    where: { id: param(req, "id"), restaurantId: rid(req) },
+  });
+  if (!zRow) throw new OrderError("NOT_FOUND", 404);
+  await prisma.deliveryZone.delete({ where: { id: zRow.id } });
+  res.json({ ok: true });
+});
+
+staff.get("/staff/promos", requireRole("JEFE"), async (req, res) => {
+  res.json(
+    await prisma.promoCode.findMany({
+      where: { restaurantId: rid(req) },
+      orderBy: { code: "asc" },
+    })
+  );
+});
+
+staff.post("/staff/promos", requireRole("JEFE"), async (req, res) => {
+  const body = z
+    .object({
+      code: z.string().min(2).max(40),
+      discountType: z.enum(["PERCENTAGE", "FIXED_AMOUNT"]),
+      discountValue: z.number().positive(),
+      minOrderAmount: z.number().min(0).default(0),
+      maxUses: z.number().int().positive().nullable().optional(),
+      expiresAt: z.string().datetime().nullable().optional(),
+      isActive: z.boolean().optional(),
+    })
+    .parse(req.body);
+  const code = body.code.trim().toUpperCase();
+  res.status(201).json(
+    await prisma.promoCode.upsert({
+      where: { restaurantId_code: { restaurantId: rid(req), code } },
+      create: {
+        restaurantId: rid(req),
+        code,
+        discountType: body.discountType,
+        discountValue: body.discountValue,
+        minOrderAmount: body.minOrderAmount,
+        maxUses: body.maxUses ?? null,
+        expiresAt: body.expiresAt ? new Date(body.expiresAt) : null,
+        isActive: body.isActive ?? true,
+      },
+      update: {
+        discountType: body.discountType,
+        discountValue: body.discountValue,
+        minOrderAmount: body.minOrderAmount,
+        maxUses: body.maxUses ?? null,
+        expiresAt: body.expiresAt ? new Date(body.expiresAt) : null,
+        isActive: body.isActive ?? true,
+      },
+    })
+  );
+});
+
+staff.delete("/staff/promos/:id", requireRole("JEFE"), async (req, res) => {
+  const pRow = await prisma.promoCode.findFirst({
+    where: { id: param(req, "id"), restaurantId: rid(req) },
+  });
+  if (!pRow) throw new OrderError("NOT_FOUND", 404);
+  await prisma.promoCode.delete({ where: { id: pRow.id } });
+  res.json({ ok: true });
+});
+
+// ---------- Jefe Sales & Operations Analytics (Resumen) ----------
+staff.get("/staff/analytics", requireRole("JEFE"), async (req, res) => {
+  const r = await prisma.restaurant.findUniqueOrThrow({
+    where: { id: rid(req) },
+    include: { settings: true },
+  });
+  const defaultFrom = workingDayStart(new Date(), r.timezone, r.settings?.dayResetHour ?? 2);
+  const from = req.query.from ? new Date(String(req.query.from)) : defaultFrom;
+  const to = req.query.to ? new Date(String(req.query.to)) : new Date();
+
+  const orders = await prisma.order.findMany({
+    where: {
+      restaurantId: rid(req),
+      status: { not: "CANCELLED" },
+      createdAt: { gte: from, lte: to },
+    },
+    include: {
+      items: true,
+      events: true,
+      repartidor: { select: { id: true, name: true } },
+    },
+  });
+
+  const grossRevenue = orders.reduce((s, o) => s + Number(o.total), 0);
+  const netAmount = orders.reduce((s, o) => s + Number(o.netAmount), 0);
+  const vatAmount = orders.reduce((s, o) => s + Number(o.vatAmount), 0);
+  const orderCount = orders.length;
+  const averageTicket = orderCount > 0 ? grossRevenue / orderCount : 0;
+
+  const cashOrders = orders.filter((o) => o.paymentMethod === "CASH");
+  const cardOrders = orders.filter((o) => o.paymentMethod === "CARD");
+  const cashTotal = cashOrders.reduce((s, o) => s + Number(o.total), 0);
+  const cardTotal = cardOrders.reduce((s, o) => s + Number(o.total), 0);
+
+  const prepSamples: number[] = [];
+  const deliverySamples: number[] = [];
+  const productAgg = new Map<string, { name: string; quantity: number; revenue: number }>();
+  const riderAgg = new Map<string, { name: string; deliveries: number }>();
+
+  for (const o of orders) {
+    const readyEv = o.events.find((e) => e.type === "READY");
+    if (readyEv) {
+      prepSamples.push((readyEv.createdAt.getTime() - o.createdAt.getTime()) / 60_000);
+    }
+    if (o.deliveredAt) {
+      const refTime = readyEv ? readyEv.createdAt.getTime() : o.createdAt.getTime();
+      deliverySamples.push((o.deliveredAt.getTime() - refTime) / 60_000);
+      if (o.repartidor) {
+        const cur = riderAgg.get(o.repartidor.id) ?? { name: o.repartidor.name, deliveries: 0 };
+        cur.deliveries += 1;
+        riderAgg.set(o.repartidor.id, cur);
+      }
+    }
+    for (const item of o.items) {
+      const cur = productAgg.get(item.name) ?? { name: item.name, quantity: 0, revenue: 0 };
+      cur.quantity += item.quantity;
+      cur.revenue += Number(item.unitPrice) * item.quantity;
+      productAgg.set(item.name, cur);
+    }
+  }
+
+  const avg = (arr: number[]) => (arr.length ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1)) : 0);
+
+  res.json({
+    from,
+    to,
+    grossRevenue: Number(grossRevenue.toFixed(2)),
+    netAmount: Number(netAmount.toFixed(2)),
+    vatAmount: Number(vatAmount.toFixed(2)),
+    orderCount,
+    averageTicket: Number(averageTicket.toFixed(2)),
+    cashTotal: Number(cashTotal.toFixed(2)),
+    cashCount: cashOrders.length,
+    cardTotal: Number(cardTotal.toFixed(2)),
+    cardCount: cardOrders.length,
+    avgPrepMinutes: avg(prepSamples),
+    avgDeliveryMinutes: avg(deliverySamples),
+    topProducts: [...productAgg.values()].sort((a, b) => b.quantity - a.quantity).slice(0, 5),
+    deliveriesByRider: [...riderAgg.values()].sort((a, b) => b.deliveries - a.deliveries),
+  });
 });
 
 // ---------- Push: device registration and language ----------

@@ -2,6 +2,21 @@ import 'package:flutter/material.dart';
 import '../api.dart';
 import '../common.dart';
 
+class _CartLine {
+  final Map product;
+  final List<Map> modifiers;
+  int quantity;
+
+  _CartLine({required this.product, required this.modifiers, this.quantity = 1});
+
+  String get key {
+    final ids = modifiers.map((m) => m['id'] as String).toList()..sort();
+    return '${product['id']}::${ids.join(',')}';
+  }
+
+  num get unitPrice => n(product['price']) + modifiers.fold<num>(0, (s, m) => s + n(m['priceDelta']));
+}
+
 /// Phone order typed in by the jefe (same structured client & address form as the website).
 class ManualOrderScreen extends StatefulWidget {
   const ManualOrderScreen({super.key});
@@ -11,9 +26,9 @@ class ManualOrderScreen extends StatefulWidget {
 
 class _ManualOrderScreenState extends State<ManualOrderScreen> {
   List<dynamic> cats = [];
-  final qty = <String, int>{};
+  final List<_CartLine> cart = [];
   final c = {
-    for (final k in ['name', 'phone', 'street', 'number', 'postal', 'floor', 'door', 'notes', 'cash'])
+    for (final k in ['name', 'phone', 'street', 'number', 'postal', 'floor', 'door', 'notes', 'cash', 'promo'])
       k: TextEditingController()
   };
   String type = 'calle';
@@ -40,28 +55,197 @@ class _ManualOrderScreenState extends State<ManualOrderScreen> {
 
   String t(String k) => c[k]!.text.trim();
 
-  Map<String, Map> get _productsById => {
-        for (final cat in cats.cast<Map>())
-          for (final p in (cat['products'] as List).cast<Map>()) p['id'] as String: p,
-      };
+  int get _count => cart.fold(0, (s, l) => s + l.quantity);
 
-  int get _count => qty.values.fold(0, (s, q) => s + (q > 0 ? q : 0));
+  num get _total => cart.fold<num>(0, (s, l) => s + l.unitPrice * l.quantity);
 
-  num get _total {
-    final map = _productsById;
-    num sum = 0;
-    for (final e in qty.entries) {
-      if (e.value > 0 && map[e.key] != null) {
-        sum += n(map[e.key]!['price']) * e.value;
+  int _productCount(String productId) =>
+      cart.where((l) => l.product['id'] == productId).fold(0, (s, l) => s + l.quantity);
+
+  void _addLine(Map product, List<Map> modifiers) {
+    final candidate = _CartLine(product: product, modifiers: modifiers, quantity: 1);
+    setState(() {
+      final idx = cart.indexWhere((l) => l.key == candidate.key);
+      if (idx >= 0) {
+        cart[idx].quantity = (cart[idx].quantity + 1).clamp(1, 50).toInt();
+      } else {
+        cart.add(candidate);
       }
+    });
+  }
+
+  void _decrementSimpleOrLast(String productId) {
+    setState(() {
+      final idx = cart.lastIndexWhere((l) => l.product['id'] == productId);
+      if (idx < 0) return;
+      if (cart[idx].quantity > 1) {
+        cart[idx].quantity--;
+      } else {
+        cart.removeAt(idx);
+      }
+    });
+  }
+
+  Future<void> _onTapAddProduct(Map p) async {
+    final rawGroups = ((p['modifierGroups'] as List?) ?? []).cast<Map>();
+    final groups = <Map>[
+      for (final g in rawGroups)
+        if (g['modifierGroup'] is Map) g['modifierGroup'] as Map else g
+    ];
+    if (groups.isEmpty) {
+      _addLine(p, const []);
+      return;
     }
-    return sum;
+
+    final selected = <String, Set<String>>{
+      for (final g in groups) g['id'] as String: <String>{},
+    };
+    final isCombo = p['isCombo'] == true;
+
+    final chosen = await showDialog<List<Map>>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          bool allValid = true;
+          for (final g in groups) {
+            final gid = g['id'] as String;
+            final minSel = n(g['minSelections']).toInt();
+            final maxSel = n(g['maxSelections']).toInt();
+            final cnt = selected[gid]?.length ?? 0;
+            if (cnt < minSel || (maxSel > 0 && cnt > maxSel)) {
+              allValid = false;
+              break;
+            }
+          }
+
+          num extra = 0;
+          final chosenList = <Map>[];
+          for (final g in groups) {
+            final gid = g['id'] as String;
+            final opts = ((g['options'] as List?) ?? []).cast<Map>();
+            for (final o in opts) {
+              if ((selected[gid] ?? const <String>{}).contains(o['id'])) {
+                extra += n(o['priceDelta']);
+                chosenList.add(o);
+              }
+            }
+          }
+
+          return AlertDialog(
+            title: Text(p['name'] as String),
+            content: SizedBox(
+              width: 420,
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (var i = 0; i < groups.length; i++) ...[
+                      Builder(builder: (_) {
+                        final g = groups[i];
+                        final gid = g['id'] as String;
+                        final minSel = n(g['minSelections']).toInt();
+                        final maxSel = n(g['maxSelections']).toInt();
+                        final opts = ((g['options'] as List?) ?? []).cast<Map>();
+                        final picks = selected[gid]!;
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${isCombo ? 'Paso ${i + 1}: ' : ''}${g['name']}'
+                                '${minSel > 0 ? ' (Obligatorio)' : ' (Opcional)'}'
+                                '${maxSel > 1 ? ' · máx. $maxSel' : ''}',
+                                style: const TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 4),
+                              for (final o in opts)
+                                Builder(builder: (_) {
+                                  final oid = o['id'] as String;
+                                  final avail = o['isAvailable'] != false;
+                                  final delta = n(o['priceDelta']);
+                                  final deltaTxt = delta > 0 ? ' (+${eur(delta)})' : '';
+                                  final label = avail ? '${o['name']}$deltaTxt' : '${o['name']} (Agotado)';
+                                  final isChecked = picks.contains(oid);
+                                  if (maxSel == 1) {
+                                    return RadioListTile<String>(
+                                      dense: true,
+                                      contentPadding: EdgeInsets.zero,
+                                      value: oid,
+                                      groupValue: picks.isNotEmpty ? picks.first : null,
+                                      title: Text(label),
+                                      onChanged: !avail
+                                          ? null
+                                          : (v) => setD(() {
+                                                if (v == null) return;
+                                                if (isChecked && minSel == 0) {
+                                                  picks.clear();
+                                                } else {
+                                                  picks
+                                                    ..clear()
+                                                    ..add(v);
+                                                }
+                                              }),
+                                    );
+                                  }
+                                  return CheckboxListTile(
+                                    dense: true,
+                                    contentPadding: EdgeInsets.zero,
+                                    controlAffinity: ListTileControlAffinity.leading,
+                                    value: isChecked,
+                                    title: Text(label),
+                                    onChanged: !avail
+                                        ? null
+                                        : (v) => setD(() {
+                                              if (v == true) {
+                                                if (maxSel <= 0 || picks.length < maxSel) {
+                                                  picks.add(oid);
+                                                }
+                                              } else {
+                                                picks.remove(oid);
+                                              }
+                                            }),
+                                  );
+                                }),
+                            ],
+                          ),
+                        );
+                      }),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+              FilledButton(
+                onPressed: allValid ? () => Navigator.pop(ctx, chosenList) : null,
+                child: Text('Añadir · ${eur(n(p['price']) + extra)}'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (chosen != null) {
+      _addLine(p, chosen);
+    }
   }
 
   Future<void> _submit() async {
     final items = [
-      for (final e in qty.entries)
-        if (e.value > 0) {'productId': e.key, 'quantity': e.value}
+      for (final line in cart)
+        if (line.quantity > 0)
+          {
+            'productId': line.product['id'],
+            'quantity': line.quantity,
+            if (line.modifiers.isNotEmpty)
+              'selectedModifiers': [
+                for (final m in line.modifiers) {'modifierOptionId': m['id']}
+              ],
+          }
     ];
     if (items.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Añade al menos un producto.')));
@@ -96,6 +280,7 @@ class _ManualOrderScreenState extends State<ManualOrderScreen> {
         if (t('floor').isNotEmpty) 'floor': t('floor'),
         if (t('door').isNotEmpty) 'door': t('door'),
         if (t('notes').isNotEmpty) 'notes': t('notes'),
+        if (t('promo').isNotEmpty) 'promoCode': t('promo').toUpperCase(),
         'paymentMethod': pay,
         if (pay == 'CASH' && cash != null) 'cashAmount': cash,
         'items': items,
@@ -166,26 +351,93 @@ class _ManualOrderScreenState extends State<ManualOrderScreen> {
             child: Text(cat['name'] as String, style: Theme.of(context).textTheme.titleMedium),
           ),
           for (final p in (cat['products'] as List).cast<Map>())
-            Card(
-              child: ListTile(
-                dense: true,
-                title: Text('${p['name']} · ${eur(p['price'])}', style: const TextStyle(fontWeight: FontWeight.w600)),
-                subtitle: (p['description'] ?? '').toString().isNotEmpty ? Text(p['description'] as String) : null,
-                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                  if ((qty[p['id']] ?? 0) > 0) ...[
-                    IconButton(
-                      icon: const Icon(Icons.remove_circle_outline),
-                      onPressed: () => setState(() => qty[p['id'] as String] = ((qty[p['id']] ?? 0) - 1).clamp(0, 50).toInt()),
+            Builder(builder: (_) {
+              final pid = p['id'] as String;
+              final cnt = _productCount(pid);
+              final allergens = ((p['allergens'] as List?) ?? []).cast<String>();
+              final desc = (p['description'] ?? '').toString();
+              final hasGroups = ((p['modifierGroups'] as List?) ?? []).isNotEmpty;
+              final subParts = <String>[
+                if (desc.isNotEmpty) desc,
+                if (hasGroups) 'Con opciones personalizables',
+                if (allergens.isNotEmpty) 'Alérgenos: ${allergens.join(', ')}',
+              ];
+              return Card(
+                child: ListTile(
+                  dense: true,
+                  title: Row(children: [
+                    Flexible(
+                      child: Text(
+                        '${p['name']} · ${eur(p['price'])}',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
                     ),
-                    Text('${qty[p['id']] ?? 0}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                  ],
-                  IconButton(
-                    icon: const Icon(Icons.add_circle_outline),
-                    onPressed: () => setState(() => qty[p['id'] as String] = ((qty[p['id']] ?? 0) + 1).clamp(0, 50).toInt()),
-                  ),
-                ]),
+                    if (p['isCombo'] == true) ...[
+                      const SizedBox(width: 6),
+                      const Chip(
+                        label: Text('COMBO', style: TextStyle(fontSize: 10)),
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                      ),
+                    ],
+                  ]),
+                  subtitle: subParts.isNotEmpty ? Text(subParts.join('\n')) : null,
+                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                    if (cnt > 0) ...[
+                      IconButton(
+                        icon: const Icon(Icons.remove_circle_outline),
+                        onPressed: () => _decrementSimpleOrLast(pid),
+                      ),
+                      Text('$cnt', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    ],
+                    IconButton(
+                      icon: const Icon(Icons.add_circle_outline),
+                      onPressed: () => _onTapAddProduct(p),
+                    ),
+                  ]),
+                ),
+              );
+            }),
+        ],
+        if (cart.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text('Resumen del carrito', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 6),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Column(
+                children: [
+                  for (var i = 0; i < cart.length; i++)
+                    Builder(builder: (_) {
+                      final line = cart[i];
+                      final modNames = line.modifiers.map((m) => '+ ${m['name']}').join(', ');
+                      return ListTile(
+                        dense: true,
+                        title: Text('${line.quantity}x ${line.product['name']} · ${eur(line.unitPrice * line.quantity)}'),
+                        subtitle: modNames.isNotEmpty ? Text(modNames) : null,
+                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                          IconButton(
+                            icon: const Icon(Icons.remove_circle_outline, size: 20),
+                            onPressed: () => setState(() {
+                              if (line.quantity > 1) {
+                                line.quantity--;
+                              } else {
+                                cart.removeAt(i);
+                              }
+                            }),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.add_circle_outline, size: 20),
+                            onPressed: () => setState(() => line.quantity = (line.quantity + 1).clamp(1, 50).toInt()),
+                          ),
+                        ]),
+                      );
+                    }),
+                ],
               ),
             ),
+          ),
         ],
         const SizedBox(height: 12),
         Text('Datos del cliente', style: Theme.of(context).textTheme.titleMedium),
@@ -243,6 +495,8 @@ class _ManualOrderScreenState extends State<ManualOrderScreen> {
                 maxLength: 500,
                 hint: 'Ej.: llámame al llegar / no llames al timbre, hay un bebé',
               ),
+              const SizedBox(height: 10),
+              _field('promo', 'Código promocional (opcional)', hint: 'Ej.: BIENVENIDA'),
             ]),
           ),
         ),

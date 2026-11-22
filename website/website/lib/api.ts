@@ -45,7 +45,30 @@ export const errorText: Record<string, string> = {
   ALREADY_RATED: "Ya has valorado este pedido. ¡Gracias!",
   EMAIL_TAKEN: "Ya existe una cuenta con ese correo electrónico.",
   INVALID_CREDENTIALS: "Correo o contraseña incorrectos.",
+  MODIFIER_UNAVAILABLE: "Algún extra o tamaño ya no está disponible.",
+  INVALID_MODIFIERS: "Revisa las opciones obligatorias del producto.",
+  INVALID_PROMO: "El código promocional no es válido.",
+  PROMO_EXPIRED: "Este código promocional ha caducado.",
+  PROMO_LIMIT_REACHED: "Este código promocional ya alcanzó su límite de usos.",
+  PROMO_MIN_ORDER: "No se alcanza el importe mínimo para este código promocional.",
 };
+
+export const EU_ALLERGENS: { code: string; label: string; icon: string }[] = [
+  { code: "GLUTEN", label: "Gluten", icon: "🌾" },
+  { code: "CRUSTACEANS", label: "Crustáceos", icon: "🦐" },
+  { code: "EGGS", label: "Huevos", icon: "🥚" },
+  { code: "FISH", label: "Pescado", icon: "🐟" },
+  { code: "PEANUTS", label: "Cacahuetes", icon: "🥜" },
+  { code: "SOYBEANS", label: "Soja", icon: "🫘" },
+  { code: "MILK", label: "Lácteos", icon: "🥛" },
+  { code: "NUTS", label: "Frutos de cáscara", icon: "🌰" },
+  { code: "CELERY", label: "Apio", icon: "🥬" },
+  { code: "MUSTARD", label: "Mostaza", icon: "🟡" },
+  { code: "SESAME", label: "Sésamo", icon: "⚪" },
+  { code: "SULPHITES", label: "Sulfitos", icon: "🍷" },
+  { code: "LUPIN", label: "Altramuces", icon: "🌼" },
+  { code: "MOLLUSCS", label: "Moluscos", icon: "🦪" },
+];
 export const msg = (e: unknown) => errorText[e instanceof ApiError ? e.code : "NETWORK"] ?? "Ha ocurrido un error.";
 
 export const eur = (v: string | number) => `${Number(v).toFixed(2).replace(".", ",")} €`;

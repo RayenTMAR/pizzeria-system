@@ -15,9 +15,25 @@ publicRoutes.get("/public/:slug/menu", async (req, res) => {
     where: { slug: req.params.slug },
     include: {
       hours: true,
+      deliveryZones: { where: { isActive: true }, orderBy: { minKm: "asc" } },
       categories: {
         orderBy: { position: "asc" },
-        include: { products: { where: { available: true } } },
+        include: {
+          products: {
+            where: { available: true },
+            orderBy: { name: "asc" },
+            include: {
+              modifierGroups: {
+                orderBy: { sortOrder: "asc" },
+                include: {
+                  modifierGroup: {
+                    include: { options: { orderBy: { sortOrder: "asc" } } },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
   });
@@ -26,15 +42,47 @@ publicRoutes.get("/public/:slug/menu", async (req, res) => {
   const open = r.hours.some(
     (h) => h.weekday === weekday && minutes >= h.openMin && minutes < h.closeMin
   );
-  res.json({ name: r.name, open, hours: r.hours, categories: r.categories });
+  res.json({
+    name: r.name,
+    open,
+    extraPrepMinutes: r.extraPrepMinutes,
+    deliveryZones: r.deliveryZones,
+    hours: r.hours,
+    categories: r.categories,
+  });
 });
 
-/** Estimated time + zone/hours check for an address, before the client places the order. */
+/** Estimated time + zone/hours/promo check for an address, before the client places the order. */
 publicRoutes.post("/public/:slug/quote", async (req, res) => {
   const r = await prisma.restaurant.findUnique({ where: { slug: req.params.slug } });
   if (!r) throw new OrderError("RESTAURANT_UNAVAILABLE", 404);
-  const a = z.object(addressFields).pick({ streetType: true, streetName: true, streetNumber: true, postalCode: true }).parse(req.body);
-  res.json(await quoteAddress(r.id, a));
+  const body = z
+    .object({
+      ...addressFields,
+      subtotal: z.number().nonnegative().optional(),
+      promoCode: z.string().max(40).optional(),
+    })
+    .pick({
+      streetType: true,
+      streetName: true,
+      streetNumber: true,
+      postalCode: true,
+      subtotal: true,
+      promoCode: true,
+    })
+    .parse(req.body);
+  res.json(
+    await quoteAddress(
+      r.id,
+      {
+        streetType: body.streetType,
+        streetName: body.streetName,
+        streetNumber: body.streetNumber,
+        postalCode: body.postalCode,
+      },
+      { subtotal: body.subtotal, promoCode: body.promoCode }
+    )
+  );
 });
 
 /** Guest or logged-in client checkout. Auto-accepted: the ticket prints in the kitchen. */
@@ -221,19 +269,53 @@ publicRoutes.patch("/public/:slug/clients/me", async (req, res) => {
 publicRoutes.get("/public/orders/:token", async (req, res) => {
   const o = await prisma.order.findUnique({
     where: { trackingToken: req.params.token },
-    include: { repartidor: { select: { name: true } }, rating: { select: { score: true } } },
+    include: {
+      restaurant: { include: { settings: { select: { lat: true, lng: true } } } },
+      repartidor: { select: { name: true, lastLat: true, lastLng: true, lastLocationAt: true } },
+      rating: { select: { score: true } },
+      items: { include: { modifiers: true } },
+    },
   });
   if (!o) throw new OrderError("NOT_FOUND", 404);
+
+  const twoMinAgo = Date.now() - 2 * 60 * 1000;
+  const freshRiderLoc =
+    o.status === "ON_THE_WAY" &&
+    o.repartidor?.lastLat != null &&
+    o.repartidor?.lastLng != null &&
+    o.repartidor?.lastLocationAt != null &&
+    o.repartidor.lastLocationAt.getTime() >= twoMinAgo
+      ? {
+          lat: o.repartidor.lastLat,
+          lng: o.repartidor.lastLng,
+          updatedAt: o.repartidor.lastLocationAt,
+        }
+      : null;
+
   res.json({
     number: o.number,
+    invoiceNumber: o.invoiceNumber,
     status: o.status,
     rated: !!o.rating,
     etaMinutes: o.etaMinutes,
+    total: o.total,
+    unreachableStartedAt: o.unreachableStartedAt,
+    items: o.items,
     cancelReason: o.status === "CANCELLED" ? o.cancelReason : null,
     repartidorName:
       o.status === "ON_THE_WAY" || o.status === "DELIVERED"
         ? o.repartidor?.name.split(" ")[0]
         : null,
+    ...(o.status === "ON_THE_WAY"
+      ? {
+          restaurantLocation: o.restaurant.settings
+            ? { lat: o.restaurant.settings.lat, lng: o.restaurant.settings.lng }
+            : null,
+          destinationLocation:
+            o.destLat != null && o.destLng != null ? { lat: o.destLat, lng: o.destLng } : null,
+          riderLocation: freshRiderLoc,
+        }
+      : {}),
   });
 });
 

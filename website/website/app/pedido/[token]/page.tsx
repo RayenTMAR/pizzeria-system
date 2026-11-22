@@ -2,15 +2,28 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { api, msg, ApiError, playMessageSound } from "@/lib/api";
+import { api, msg, ApiError, playMessageSound, eur } from "@/lib/api";
 
 type Tracking = {
   number: number;
+  invoiceNumber?: string | null;
   status: "NEW" | "IN_KITCHEN" | "READY" | "ON_THE_WAY" | "DELIVERED" | "CANCELLED";
   etaMinutes: number;
+  total?: string;
+  unreachableStartedAt?: string | null;
+  items?: {
+    id: string;
+    name: string;
+    quantity: number;
+    unitPrice: string;
+    modifiers?: { id: string; optionName: string; priceDelta: string }[];
+  }[];
   cancelReason: string | null;
   repartidorName: string | null;
   rated: boolean;
+  restaurantLocation?: { lat: number; lng: number } | null;
+  destinationLocation?: { lat: number; lng: number } | null;
+  riderLocation?: { lat: number; lng: number; updatedAt: string } | null;
 };
 
 type ChatMsg = {
@@ -206,6 +219,63 @@ function OrderChat({ token, repartidorName }: { token: string; repartidorName: s
   );
 }
 
+function LiveDeliveryMap({ t }: { t: Tracking }) {
+  const rest = t.restaurantLocation;
+  const dest = t.destinationLocation;
+  const rider = t.riderLocation;
+  if (!rest && !dest && !rider) return null;
+
+  const pts = [rest, dest, rider].filter((p): p is { lat: number; lng: number } => !!p);
+  const minLat = Math.min(...pts.map((p) => p.lat)) - 0.002;
+  const maxLat = Math.max(...pts.map((p) => p.lat)) + 0.002;
+  const minLng = Math.min(...pts.map((p) => p.lng)) - 0.002;
+  const maxLng = Math.max(...pts.map((p) => p.lng)) + 0.002;
+  const project = (p: { lat: number; lng: number }) => ({
+    x: 20 + ((p.lng - minLng) / Math.max(0.0001, maxLng - minLng)) * 260,
+    y: 120 - ((p.lat - minLat) / Math.max(0.0001, maxLat - minLat)) * 100,
+  });
+
+  const rp = rest ? project(rest) : null;
+  const dp = dest ? project(dest) : null;
+  const mp = rider ? project(rider) : null;
+
+  return (
+    <div className="card" style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <strong>📍 Mapa en directo</strong>
+        {rider ? (
+          <span className="muted" style={{ fontSize: ".8rem" }}>
+            GPS actualizado {new Date(rider.updatedAt).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+          </span>
+        ) : (
+          <span className="muted" style={{ fontSize: ".8rem" }}>Esperando señal GPS del repartidor…</span>
+        )}
+      </div>
+      <svg viewBox="0 0 300 140" style={{ width: "100%", height: 140, borderRadius: 10, background: "var(--bg)", border: "1px solid var(--line)" }}>
+        {rp && dp && <line x1={rp.x} y1={rp.y} x2={dp.x} y2={dp.y} stroke="var(--line)" strokeWidth="3" strokeDasharray="5,5" />}
+        {rp && (
+          <g>
+            <circle cx={rp.x} cy={rp.y} r="7" fill="var(--muted)" />
+            <text x={rp.x} y={rp.y - 11} textAnchor="middle" fontSize="10" fill="var(--text)">🏪 Local</text>
+          </g>
+        )}
+        {dp && (
+          <g>
+            <circle cx={dp.x} cy={dp.y} r="7" fill="var(--ok)" />
+            <text x={dp.x} y={dp.y - 11} textAnchor="middle" fontSize="10" fill="var(--text)">🏠 Tú</text>
+          </g>
+        )}
+        {mp && (
+          <g>
+            <circle cx={mp.x} cy={mp.y} r="9" fill="var(--accent)" />
+            <text x={mp.x} y={mp.y - 13} textAnchor="middle" fontSize="11" fontWeight="bold" fill="var(--accent)">🛵 Repartidor</text>
+          </g>
+        )}
+      </svg>
+    </div>
+  );
+}
+
 export default function Tracking() {
   const { token } = useParams<{ token: string }>();
   const [t, setT] = useState<Tracking | null>(null);
@@ -228,21 +298,47 @@ export default function Tracking() {
 
   return (
     <main>
-      <p className="muted">Pedido #{t.number}</p>
+      <p className="muted">
+        Pedido #{t.number}{t.invoiceNumber ? ` · Factura ${t.invoiceNumber}` : ""}
+        {t.total ? ` · ${eur(t.total)}` : ""}
+      </p>
       <div className="status">{TITLE[t.status]}</div>
+      {t.unreachableStartedAt && t.status === "ON_THE_WAY" && (
+        <div className="banner error">
+          ⚠️ Tu repartidor está en la puerta y no logra contactar contigo. Por favor, responde en el chat o atiende el teléfono.
+        </div>
+      )}
       {t.status === "CANCELLED" ? (
         <div className="banner error">Motivo: {t.cancelReason ?? "—"}. Si tienes dudas, llámanos.</div>
       ) : (
         <>
           <div className="steps" aria-hidden>{STEPS.map((s, i) => <div key={s} className={i <= step ? "on" : ""} />)}</div>
           {t.status === "ON_THE_WAY" && (
-            <div className="card">
-              {t.repartidorName && <p style={{ margin: 0 }}>Tu repartidor es <strong>{t.repartidorName}</strong>.</p>}
-              <p style={{ margin: "6px 0 0" }}>Llegada estimada: unos <strong>{t.etaMinutes} minutos</strong>.</p>
-            </div>
+            <>
+              <div className="card">
+                {t.repartidorName && <p style={{ margin: 0 }}>Tu repartidor es <strong>{t.repartidorName}</strong>.</p>}
+                <p style={{ margin: "6px 0 0" }}>Llegada estimada: unos <strong>{t.etaMinutes} minutos</strong>.</p>
+              </div>
+              <LiveDeliveryMap t={t} />
+            </>
           )}
           {t.status !== "ON_THE_WAY" && t.status !== "DELIVERED" && (
             <p className="muted">Tiempo estimado total: unos {t.etaMinutes} minutos de trayecto, más la preparación.</p>
+          )}
+          {(t.items ?? []).length > 0 && (
+            <div className="card" style={{ marginTop: 10 }}>
+              <strong>Resumen del pedido</strong>
+              {(t.items ?? []).map((it) => (
+                <div key={it.id} style={{ marginTop: 4 }}>
+                  <div>{it.quantity}× {it.name} · {eur(Number(it.unitPrice) * it.quantity)}</div>
+                  {(it.modifiers ?? []).length > 0 && (
+                    <div className="muted" style={{ fontSize: ".82rem", paddingLeft: 12 }}>
+                      {(it.modifiers ?? []).map((m) => `+ ${m.optionName}`).join(", ")}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
           )}
           {t.status !== "DELIVERED" && <OrderChat token={token} repartidorName={t.repartidorName} />}
         </>

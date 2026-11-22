@@ -4,6 +4,40 @@ import '../common.dart';
 import '../ratings.dart';
 import 'manual_order.dart';
 
+const List<String> _euAllergens = [
+  'GLUTEN',
+  'CRUSTACEANS',
+  'EGGS',
+  'FISH',
+  'PEANUTS',
+  'SOYBEANS',
+  'MILK',
+  'NUTS',
+  'CELERY',
+  'MUSTARD',
+  'SESAME',
+  'SULPHITES',
+  'LUPIN',
+  'MOLLUSCS',
+];
+
+const Map<String, String> _allergenEs = {
+  'GLUTEN': 'Gluten',
+  'CRUSTACEANS': 'Crustáceos',
+  'EGGS': 'Huevos',
+  'FISH': 'Pescado',
+  'PEANUTS': 'Cacahuetes',
+  'SOYBEANS': 'Soja',
+  'MILK': 'Lácteos',
+  'NUTS': 'Frutos de cáscara',
+  'CELERY': 'Apio',
+  'MUSTARD': 'Mostaza',
+  'SESAME': 'Sésamo',
+  'SULPHITES': 'Sulfitos',
+  'LUPIN': 'Altramuces',
+  'MOLLUSCS': 'Moluscos',
+};
+
 class JefeHome extends StatelessWidget {
   final String name;
   final VoidCallback onLogout;
@@ -11,7 +45,7 @@ class JefeHome extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => DefaultTabController(
-        length: 5,
+        length: 6,
         child: Scaffold(
           appBar: AppBar(
             title: Text('Jefe · $name'),
@@ -24,10 +58,18 @@ class JefeHome extends StatelessWidget {
                 Tab(text: 'Caja'),
                 Tab(text: 'Menú'),
                 Tab(text: 'Valoraciones'),
+                Tab(text: 'Resumen'),
               ],
             ),
           ),
-          body: const TabBarView(children: [OrdersTab(), RidersTab(), CashTab(), MenuTab(), RatingsView()]),
+          body: const TabBarView(children: [
+            OrdersTab(),
+            RidersTab(),
+            CashTab(),
+            MenuTab(),
+            RatingsView(),
+            SummaryTab(),
+          ]),
         ),
       );
 }
@@ -41,6 +83,7 @@ class OrdersTab extends StatefulWidget {
 
 class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveClientMixin {
   List<dynamic> orders = [];
+  Map<String, dynamic> restaurantStatus = {};
   Set<String>? seen;
 
   @override
@@ -55,12 +98,22 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
   @override
   Future<void> refresh() async {
     try {
-      final data = await Api.get('/orders') as List<dynamic>;
+      final results = await Future.wait([
+        Api.get('/orders'),
+        Api.get('/staff/restaurant/status').catchError((_) => <String, dynamic>{}),
+      ]);
+      final data = results[0] as List<dynamic>;
+      final st = results[1] is Map<String, dynamic> ? results[1] as Map<String, dynamic> : <String, dynamic>{};
       if (seen != null && data.any((o) => o['status'] == 'IN_KITCHEN' && !seen!.contains(o['id']))) {
         alertSound();
       }
       seen = data.map((o) => o['id'] as String).toSet();
-      if (mounted) setState(() => orders = data);
+      if (mounted) {
+        setState(() {
+          orders = data;
+          restaurantStatus = st;
+        });
+      }
     } catch (_) {}
   }
 
@@ -70,6 +123,79 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
       await refresh();
     } catch (e) {
       if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _setPrepDelay(int extraPrepMinutes) async {
+    await _run(() => Api.patch('/staff/restaurant/prep-delay', {'extraPrepMinutes': extraPrepMinutes}));
+  }
+
+  Future<void> _optimizeRoute(String riderId) async {
+    await _run(() => Api.post('/staff/riders/$riderId/optimize-route'));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Ruta óptima recalculada')),
+      );
+    }
+  }
+
+  Future<void> _reorderStops(String riderId, String riderName, List<Map> activeOrders) async {
+    final ordered = [...activeOrders]
+      ..sort((a, b) => n(a['stopNumber'] ?? 99).compareTo(n(b['stopNumber'] ?? 99)));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => StatefulBuilder(
+        builder: (d, setD) => AlertDialog(
+          title: Text('Ordenar paradas · $riderName'),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (var i = 0; i < ordered.length; i++)
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: CircleAvatar(radius: 14, child: Text('${i + 1}')),
+                    title: Text('#${ordered[i]['number']} · ${ordered[i]['clientName']}'),
+                    subtitle: Text(addressLine(ordered[i])),
+                    trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                      IconButton(
+                        icon: const Icon(Icons.arrow_upward, size: 18),
+                        onPressed: i == 0
+                            ? null
+                            : () => setD(() {
+                                  final tmp = ordered[i - 1];
+                                  ordered[i - 1] = ordered[i];
+                                  ordered[i] = tmp;
+                                }),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.arrow_downward, size: 18),
+                        onPressed: i == ordered.length - 1
+                            ? null
+                            : () => setD(() {
+                                  final tmp = ordered[i + 1];
+                                  ordered[i + 1] = ordered[i];
+                                  ordered[i] = tmp;
+                                }),
+                      ),
+                    ]),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancelar')),
+            FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Guardar orden')),
+          ],
+        ),
+      ),
+    );
+    if (ok == true) {
+      await _run(() => Api.post('/staff/riders/$riderId/reorder-stops', {
+            'orderIds': [for (final o in ordered) o['id']],
+          }));
     }
   }
 
@@ -120,14 +246,26 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
 
   Widget _card(Map o) {
     final st = o['status'] as String;
-    final items = (o['items'] as List).map((i) => '${i['quantity']}× ${i['name']}').join(', ');
+    final itemsLines = (o['items'] as List).map((i) {
+      final mods = ((i['modifiers'] as List?) ?? []).cast<Map>();
+      final modStr = mods.isEmpty ? '' : '\n   + ${mods.map((m) => m['optionName']).join(', ')}';
+      return '${i['quantity']}× ${i['name']}$modStr';
+    }).join('\n');
     final b = <Widget>[];
     if (st == 'IN_KITCHEN') {
       b.add(FilledButton(onPressed: () => _run(() => Api.post('/orders/${o['id']}/ready')), child: const Text('Listo')));
       b.add(OutlinedButton(onPressed: () => _run(() => Api.post('/orders/${o['id']}/reprint')), child: const Text('Reimprimir')));
     }
     if (st == 'READY') b.add(FilledButton(onPressed: () => _assign(o), child: const Text('Asignar')));
-    if (st == 'ON_THE_WAY') b.add(OutlinedButton(onPressed: () => _assign(o), child: const Text('Reasignar')));
+    if (st == 'ON_THE_WAY') {
+      b.add(OutlinedButton(onPressed: () => _assign(o), child: const Text('Reasignar')));
+      if (o['unreachableStartedAt'] != null) {
+        b.add(OutlinedButton(
+          onPressed: () => _run(() => Api.post('/orders/${o['id']}/unreachable-return')),
+          child: const Text('Devolver a tienda'),
+        ));
+      }
+    }
     if (st != 'DELIVERED' && st != 'CANCELLED') {
       b.add(TextButton(onPressed: () => _cancel(o), child: const Text('Cancelar')));
     }
@@ -135,11 +273,38 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('#${o['number']} · ${o['clientName']} · ${hhmm(o['createdAt'] as String)}',
-              style: Theme.of(context).textTheme.titleMedium),
+          Row(children: [
+            Expanded(
+              child: Text(
+                '#${o['number']}${o['invoiceNumber'] != null ? ' · Fact. ${o['invoiceNumber']}' : ''} · ${o['clientName']} · ${hhmm(o['createdAt'] as String)}',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            if (o['stopNumber'] != null && st == 'ON_THE_WAY')
+              Chip(
+                label: Text('Parada ${o['stopNumber']}'),
+                visualDensity: VisualDensity.compact,
+              ),
+          ]),
+          if (o['printFailed'] == true)
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text(
+                '⚠ Ticket pendiente de imprimir (>60s)',
+                style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+              ),
+            ),
+          if (o['unreachableStartedAt'] != null && st == 'ON_THE_WAY')
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text(
+                '⏱ Cliente no contesta (aviso enviado)',
+                style: TextStyle(color: Colors.deepOrange, fontWeight: FontWeight.bold),
+              ),
+            ),
           Text(addressLine(o)),
           Text('Tel: ${o['clientPhone']}'),
-          Text(items),
+          Text(itemsLines),
           Text(payLine(o)),
           if ((o['notes'] ?? '').toString().isNotEmpty)
             Text('Notas: ${o['notes']}', style: const TextStyle(fontStyle: FontStyle.italic)),
@@ -160,6 +325,20 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
       ['ON_THE_WAY', 'En camino'],
       ['DELIVERED', 'Entregados'],
     ];
+
+    final extraPrep = n(restaurantStatus['extraPrepMinutes'] ?? 0).toInt();
+    final printerOffline = restaurantStatus['printerOffline'] == true;
+    final unprintedAlerts = ((restaurantStatus['unprintedAlerts'] as List?) ?? []).cast<Map>();
+
+    final onTheWayByRider = <String, List<Map>>{};
+    for (final raw in orders) {
+      final o = raw as Map;
+      if (o['status'] == 'ON_THE_WAY' && o['repartidor'] is Map) {
+        final rId = o['repartidor']['id'] as String;
+        onTheWayByRider.putIfAbsent(rId, () => []).add(o);
+      }
+    }
+
     return Scaffold(
       floatingActionButton: FloatingActionButton.extended(
         icon: const Icon(Icons.add),
@@ -174,6 +353,102 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
         child: ListView(
           padding: const EdgeInsets.fromLTRB(8, 8, 8, 88),
           children: [
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    const Text('Modo hora punta: ', style: TextStyle(fontWeight: FontWeight.w600)),
+                    const SizedBox(width: 6),
+                    Wrap(spacing: 6, children: [
+                      for (final m in [0, 15, 30])
+                        ChoiceChip(
+                          label: Text(m == 0 ? 'Normal' : '+$m min'),
+                          selected: extraPrep == m,
+                          onSelected: (_) => _setPrepDelay(m),
+                        ),
+                    ]),
+                  ]),
+                  const SizedBox(height: 6),
+                  Row(children: [
+                    Icon(
+                      printerOffline ? Icons.print_disabled : Icons.print,
+                      size: 16,
+                      color: printerOffline ? Colors.red : Colors.green,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      printerOffline
+                          ? 'Impresora CloudPRNT sin señal (>45s)'
+                          : (restaurantStatus['lastPrinterPollAt'] != null
+                              ? 'Impresora CloudPRNT online'
+                              : 'Esperando primera conexión de impresora'),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: printerOffline ? Colors.red : Colors.black54,
+                        fontWeight: printerOffline ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                  ]),
+                ]),
+              ),
+            ),
+            if (unprintedAlerts.isNotEmpty)
+              Card(
+                color: Colors.red.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text(
+                      '⚠ Alerta de impresión (>60s en cocina sin imprimir)',
+                      style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 4),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        for (final a in unprintedAlerts)
+                          ActionChip(
+                            label: Text('Reimprimir #${a['number']}'),
+                            onPressed: () => _run(() => Api.post('/orders/${a['id']}/reprint')),
+                          ),
+                      ],
+                    ),
+                  ]),
+                ),
+              ),
+            for (final entry in onTheWayByRider.entries)
+              if (entry.value.length >= 2)
+                Card(
+                  color: Colors.blue.shade50,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(
+                          '${entry.value.first['repartidor']['name']} · ${entry.value.length} paradas activas',
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        FilledButton.tonalIcon(
+                          icon: const Icon(Icons.route, size: 18),
+                          label: const Text('Ordenar ruta óptima'),
+                          onPressed: () => _optimizeRoute(entry.key),
+                        ),
+                        OutlinedButton(
+                          onPressed: () => _reorderStops(
+                            entry.key,
+                            entry.value.first['repartidor']['name'] as String,
+                            entry.value,
+                          ),
+                          child: const Text('Reordenar'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
             for (final s in sections) ...[
               if (orders.any((o) => o['status'] == s[0])) ...[
                 Padding(
@@ -548,6 +823,7 @@ class MenuTab extends StatefulWidget {
 
 class _MenuTabState extends State<MenuTab> {
   List<dynamic> categories = [];
+  List<dynamic> modifierGroups = [];
 
   @override
   void initState() {
@@ -557,8 +833,116 @@ class _MenuTabState extends State<MenuTab> {
 
   Future<void> _load() async {
     try {
-      final d = await Api.get('/menu?all=1') as List<dynamic>;
-      if (mounted) setState(() => categories = d);
+      final results = await Future.wait([
+        Api.get('/menu?all=1'),
+        Api.get('/menu/modifier-groups').catchError((_) => <dynamic>[]),
+      ]);
+      if (mounted) {
+        setState(() {
+          categories = results[0] as List<dynamic>;
+          modifierGroups = results[1] as List<dynamic>;
+        });
+      }
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _createModifierGroup() async {
+    final nameCtl = TextEditingController();
+    final minCtl = TextEditingController(text: '0');
+    final maxCtl = TextEditingController(text: '1');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('Nuevo grupo de modificadores'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: nameCtl, decoration: const InputDecoration(labelText: 'Nombre (ej.: Tamaño, Extras, Salsas)')),
+            const SizedBox(height: 8),
+            TextField(controller: minCtl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Mín. selecciones (1 = obligatorio)')),
+            const SizedBox(height: 8),
+            TextField(controller: maxCtl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Máx. selecciones (1 = única, >1 = múltiple)')),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Crear')),
+        ],
+      ),
+    );
+    if (ok != true || nameCtl.text.trim().isEmpty) return;
+    try {
+      await Api.post('/menu/modifier-groups', {
+        'name': nameCtl.text.trim(),
+        'minSelections': int.tryParse(minCtl.text.trim()) ?? 0,
+        'maxSelections': (int.tryParse(maxCtl.text.trim()) ?? 1).clamp(1, 50).toInt(),
+      });
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _deleteModifierGroup(Map g) async {
+    final ok = await confirm(context, 'Eliminar grupo', '¿Eliminar el grupo "${g['name']}" y sus opciones?');
+    if (!ok) return;
+    try {
+      await Api.delete('/menu/modifier-groups/${g['id']}');
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _createModifierOption(Map g) async {
+    final nameCtl = TextEditingController();
+    final deltaCtl = TextEditingController(text: '0.00');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: Text('Nueva opción en ${g['name']}'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: nameCtl, decoration: const InputDecoration(labelText: 'Nombre (ej.: Familiar, Extra Queso)')),
+          const SizedBox(height: 8),
+          TextField(
+            controller: deltaCtl,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+            decoration: const InputDecoration(labelText: 'Suplemento (€)'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Añadir')),
+        ],
+      ),
+    );
+    if (ok != true || nameCtl.text.trim().isEmpty) return;
+    try {
+      await Api.post('/menu/modifier-options', {
+        'modifierGroupId': g['id'],
+        'name': nameCtl.text.trim(),
+        'priceDelta': double.tryParse(deltaCtl.text.replaceAll(',', '.')) ?? 0,
+      });
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _toggleModifierOption(Map opt, bool v) async {
+    try {
+      await Api.patch('/menu/modifier-options/${opt['id']}', {'isAvailable': v});
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _deleteModifierOption(Map opt) async {
+    try {
+      await Api.delete('/menu/modifier-options/${opt['id']}');
+      await _load();
     } catch (e) {
       if (mounted) showError(context, e);
     }
@@ -609,49 +993,132 @@ class _MenuTabState extends State<MenuTab> {
     final descCtl = TextEditingController(text: (prod?['description'] ?? '').toString());
     final priceCtl = TextEditingController(text: prod != null ? n(prod['price']).toStringAsFixed(2) : '');
     var available = prod == null ? true : (prod['available'] as bool? ?? true);
+    var isCombo = prod != null && prod['isCombo'] == true;
+    var vatRate = prod != null && prod['vatRate'] != null ? n(prod['vatRate']).toDouble() : 10.0;
     var selectedCatId = (prod?['categoryId'] ?? categoryId).toString();
+    final selectedAllergens = <String>{
+      for (final a in ((prod?['allergens'] as List?) ?? [])) a.toString(),
+    };
+    final selectedGroupIds = <String>[
+      for (final link in ((prod?['modifierGroups'] as List?) ?? []).cast<Map>())
+        if (link['modifierGroupId'] != null)
+          link['modifierGroupId'].toString()
+        else if (link['modifierGroup'] is Map)
+          link['modifierGroup']['id'].toString(),
+    ];
 
     final ok = await showDialog<bool>(
       context: context,
       builder: (d) => StatefulBuilder(
         builder: (d, setDialogState) => AlertDialog(
           title: Text(prod == null ? 'Nuevo plato / producto' : 'Editar plato / producto'),
-          content: SingleChildScrollView(
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              DropdownButtonFormField<String>(
-                value: selectedCatId,
-                decoration: const InputDecoration(labelText: 'Categoría'),
-                items: [
-                  for (final c in categories.cast<Map>())
-                    DropdownMenuItem(value: c['id'] as String, child: Text(c['name'] as String))
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  DropdownButtonFormField<String>(
+                    value: selectedCatId,
+                    decoration: const InputDecoration(labelText: 'Categoría'),
+                    items: [
+                      for (final c in categories.cast<Map>())
+                        DropdownMenuItem(value: c['id'] as String, child: Text(c['name'] as String))
+                    ],
+                    onChanged: (v) => setDialogState(() => selectedCatId = v ?? categoryId),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: nameCtl,
+                    decoration: const InputDecoration(labelText: 'Nombre (ej.: Margarita, Kebab mixto)'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: descCtl,
+                    maxLines: 2,
+                    decoration: const InputDecoration(labelText: 'Descripción / ingredientes (opcional)'),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Expanded(
+                      child: TextField(
+                        controller: priceCtl,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                        decoration: const InputDecoration(labelText: 'Precio (€)'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: DropdownButtonFormField<double>(
+                        value: vatRate == 21.0 ? 21.0 : (vatRate == 4.0 ? 4.0 : 10.0),
+                        decoration: const InputDecoration(labelText: 'IVA (%)'),
+                        items: const [
+                          DropdownMenuItem(value: 10.0, child: Text('10% (Hostelería)')),
+                          DropdownMenuItem(value: 21.0, child: Text('21% (Bebidas/Alcohol)')),
+                          DropdownMenuItem(value: 4.0, child: Text('4% (Superreducido)')),
+                        ],
+                        onChanged: (v) => setDialogState(() => vatRate = v ?? 10.0),
+                      ),
+                    ),
+                  ]),
+                  const SizedBox(height: 4),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Disponible en la carta'),
+                    value: available,
+                    onChanged: (v) => setDialogState(() => available = v),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Es un Combo / Menú (pasos)'),
+                    value: isCombo,
+                    onChanged: (v) => setDialogState(() => isCombo = v),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text('Alérgenos UE (14 obligatorios)', style: TextStyle(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 4,
+                    children: [
+                      for (final code in _euAllergens)
+                        FilterChip(
+                          label: Text(_allergenEs[code] ?? code, style: const TextStyle(fontSize: 12)),
+                          selected: selectedAllergens.contains(code),
+                          onSelected: (sel) => setDialogState(() {
+                            if (sel) {
+                              selectedAllergens.add(code);
+                            } else {
+                              selectedAllergens.remove(code);
+                            }
+                          }),
+                        ),
+                    ],
+                  ),
+                  if (modifierGroups.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    const Text('Grupos de modificadores', style: TextStyle(fontWeight: FontWeight.w600)),
+                    for (final g in modifierGroups.cast<Map>())
+                      CheckboxListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        title: Text(g['name'] as String),
+                        value: selectedGroupIds.contains(g['id']),
+                        onChanged: (v) => setDialogState(() {
+                          final gid = g['id'] as String;
+                          if (v == true) {
+                            if (!selectedGroupIds.contains(gid)) selectedGroupIds.add(gid);
+                          } else {
+                            selectedGroupIds.remove(gid);
+                          }
+                        }),
+                      ),
+                  ],
                 ],
-                onChanged: (v) => setDialogState(() => selectedCatId = v ?? categoryId),
               ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: nameCtl,
-                decoration: const InputDecoration(labelText: 'Nombre (ej.: Margarita, Kebab mixto)'),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: descCtl,
-                maxLines: 2,
-                decoration: const InputDecoration(labelText: 'Descripción / ingredientes (opcional)'),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: priceCtl,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                decoration: const InputDecoration(labelText: 'Precio (€)'),
-              ),
-              const SizedBox(height: 8),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Disponible en la carta'),
-                value: available,
-                onChanged: (v) => setDialogState(() => available = v),
-              ),
-            ]),
+            ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancelar')),
@@ -662,23 +1129,22 @@ class _MenuTabState extends State<MenuTab> {
     );
     if (ok != true || nameCtl.text.trim().isEmpty) return;
     final price = double.tryParse(priceCtl.text.replaceAll(',', '.')) ?? 0;
+    final payload = {
+      'categoryId': selectedCatId,
+      'name': nameCtl.text.trim(),
+      'description': descCtl.text.trim(),
+      'price': price,
+      'available': available,
+      'isCombo': isCombo,
+      'vatRate': vatRate,
+      'allergens': selectedAllergens.toList(),
+      'modifierGroupIds': selectedGroupIds,
+    };
     try {
       if (prod == null) {
-        await Api.post('/menu/products', {
-          'categoryId': selectedCatId,
-          'name': nameCtl.text.trim(),
-          'description': descCtl.text.trim(),
-          'price': price,
-          'available': available,
-        });
+        await Api.post('/menu/products', payload);
       } else {
-        await Api.patch('/menu/products/${prod['id']}', {
-          'categoryId': selectedCatId,
-          'name': nameCtl.text.trim(),
-          'description': descCtl.text.trim(),
-          'price': price,
-          'available': available,
-        });
+        await Api.patch('/menu/products/${prod['id']}', payload);
       }
       await _load();
     } catch (e) {
@@ -718,6 +1184,66 @@ class _MenuTabState extends State<MenuTab> {
           child: ListView(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 88),
             children: [
+              Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Expanded(
+                        child: Text('Grupos de modificadores y extras', style: Theme.of(context).textTheme.titleMedium),
+                      ),
+                      FilledButton.tonalIcon(
+                        icon: const Icon(Icons.add, size: 18),
+                        label: const Text('Nuevo grupo'),
+                        onPressed: _createModifierGroup,
+                      ),
+                    ]),
+                    if (modifierGroups.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 8),
+                        child: Text('Sin grupos de modificadores todavía.'),
+                      ),
+                    for (final g in modifierGroups.cast<Map>()) ...[
+                      const Divider(),
+                      Row(children: [
+                        Expanded(
+                          child: Text(
+                            '${g['name']} (Mín ${g['minSelections']} · Máx ${g['maxSelections']})',
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        TextButton.icon(
+                          icon: const Icon(Icons.add, size: 16),
+                          label: const Text('Opción'),
+                          onPressed: () => _createModifierOption(g),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline, size: 20),
+                          onPressed: () => _deleteModifierGroup(g),
+                        ),
+                      ]),
+                      for (final o in ((g['options'] as List?) ?? []).cast<Map>())
+                        ListTile(
+                          dense: true,
+                          contentPadding: const EdgeInsets.only(left: 12),
+                          title: Text('${o['name']} (+${eur(o['priceDelta'])})'),
+                          subtitle: Text(o['isAvailable'] != false ? 'Disponible' : 'Agotado'),
+                          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Switch(
+                              value: o['isAvailable'] != false,
+                              onChanged: (v) => _toggleModifierOption(o, v),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.delete_outline, size: 18),
+                              onPressed: () => _deleteModifierOption(o),
+                            ),
+                          ]),
+                        ),
+                    ],
+                  ]),
+                ),
+              ),
               for (final cat in categories.cast<Map>())
                 Card(
                   margin: const EdgeInsets.only(bottom: 12),
@@ -751,33 +1277,44 @@ class _MenuTabState extends State<MenuTab> {
                           child: Text('Sin productos en esta categoría'),
                         ),
                       for (final p in (cat['products'] as List).cast<Map>())
-                        ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: Text(
-                            '${p['name']} · ${eur(p['price'])}',
-                            style: TextStyle(
-                              fontWeight: FontWeight.w600,
-                              decoration: (p['available'] as bool? ?? true) ? null : TextDecoration.lineThrough,
+                        Builder(builder: (_) {
+                          final allergens = ((p['allergens'] as List?) ?? []).cast<String>();
+                          final groups = ((p['modifierGroups'] as List?) ?? []).cast<Map>();
+                          final desc = (p['description'] ?? '').toString();
+                          final details = <String>[
+                            if (desc.isNotEmpty) desc,
+                            'IVA ${n(p['vatRate'] ?? 10).toStringAsFixed(0)}%${p['isCombo'] == true ? ' · COMBO' : ''}',
+                            if (allergens.isNotEmpty)
+                              'Alérgenos: ${allergens.map((a) => _allergenEs[a] ?? a).join(', ')}',
+                            if (groups.isNotEmpty)
+                              'Modificadores: ${groups.map((g) => g['modifierGroup']?['name'] ?? '').where((s) => s.toString().isNotEmpty).join(', ')}',
+                          ];
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(
+                              '${p['name']} · ${eur(p['price'])}',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w600,
+                                decoration: (p['available'] as bool? ?? true) ? null : TextDecoration.lineThrough,
+                              ),
                             ),
-                          ),
-                          subtitle: (p['description'] ?? '').toString().isNotEmpty
-                              ? Text(p['description'] as String)
-                              : null,
-                          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                            Switch(
-                              value: p['available'] as bool? ?? true,
-                              onChanged: (v) => _toggleAvailable(p, v),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.edit_outlined),
-                              onPressed: () => _editProduct(cat['id'] as String, p),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.delete_outline),
-                              onPressed: () => _deleteProduct(p),
-                            ),
-                          ]),
-                        ),
+                            subtitle: Text(details.join('\n')),
+                            trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                              Switch(
+                                value: p['available'] as bool? ?? true,
+                                onChanged: (v) => _toggleAvailable(p, v),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.edit_outlined),
+                                onPressed: () => _editProduct(cat['id'] as String, p),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline),
+                                onPressed: () => _deleteProduct(p),
+                              ),
+                            ]),
+                          );
+                        }),
                     ]),
                   ),
                 ),
@@ -790,4 +1327,292 @@ class _MenuTabState extends State<MenuTab> {
           ),
         ),
       );
+}
+
+// ---------------------------------------------------------------- Summary, Fiscal, Zones & Promos (jefe only)
+class SummaryTab extends StatefulWidget {
+  const SummaryTab({super.key});
+  @override
+  State<SummaryTab> createState() => _SummaryTabState();
+}
+
+class _SummaryTabState extends State<SummaryTab> {
+  Map<String, dynamic>? analytics;
+  List<dynamic> zones = [];
+  List<dynamic> promos = [];
+  final legalCtl = TextEditingController();
+  final nifCtl = TextEditingController();
+  final fiscalAddrCtl = TextEditingController();
+  final vatCtl = TextEditingController(text: '10.00');
+  bool printReceipt = true;
+  bool savingFiscal = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    legalCtl.dispose();
+    nifCtl.dispose();
+    fiscalAddrCtl.dispose();
+    vatCtl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final results = await Future.wait([
+        Api.get('/staff/analytics'),
+        Api.get('/staff/restaurant/status'),
+        Api.get('/staff/zones'),
+        Api.get('/staff/promos'),
+      ]);
+      final st = results[1] as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        analytics = results[0] as Map<String, dynamic>;
+        zones = results[2] as List<dynamic>;
+        promos = results[3] as List<dynamic>;
+        legalCtl.text = (st['legalName'] ?? '').toString();
+        nifCtl.text = (st['nifCif'] ?? '').toString();
+        fiscalAddrCtl.text = (st['fiscalAddress'] ?? '').toString();
+        vatCtl.text = n(st['defaultVatRate'] ?? 10).toStringAsFixed(2);
+        printReceipt = st['printCustomerReceipt'] != false;
+      });
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _saveFiscal() async {
+    setState(() => savingFiscal = true);
+    try {
+      await Api.patch('/staff/restaurant/fiscal', {
+        if (legalCtl.text.trim().isNotEmpty) 'legalName': legalCtl.text.trim(),
+        if (nifCtl.text.trim().isNotEmpty) 'nifCif': nifCtl.text.trim(),
+        if (fiscalAddrCtl.text.trim().isNotEmpty) 'fiscalAddress': fiscalAddrCtl.text.trim(),
+        if (double.tryParse(vatCtl.text.replaceAll(',', '.')) != null)
+          'defaultVatRate': double.parse(vatCtl.text.replaceAll(',', '.')),
+        'printCustomerReceipt': printReceipt,
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Configuración fiscal guardada')));
+      }
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    } finally {
+      if (mounted) setState(() => savingFiscal = false);
+    }
+  }
+
+  Future<void> _createZone() async {
+    final nameCtl = TextEditingController();
+    final minKmCtl = TextEditingController(text: '0');
+    final maxKmCtl = TextEditingController(text: '3');
+    final feeCtl = TextEditingController(text: '1.50');
+    final minOrdCtl = TextEditingController(text: '10.00');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('Nueva zona de reparto'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: nameCtl, decoration: const InputDecoration(labelText: 'Nombre (ej.: Zona Centro)')),
+            TextField(controller: minKmCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Km mínimos')),
+            TextField(controller: maxKmCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Km máximos')),
+            TextField(controller: feeCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Gastos de envío (€)')),
+            TextField(controller: minOrdCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Pedido mínimo (€)')),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Guardar')),
+        ],
+      ),
+    );
+    if (ok != true || nameCtl.text.trim().isEmpty) return;
+    try {
+      await Api.post('/staff/zones', {
+        'name': nameCtl.text.trim(),
+        'minKm': double.tryParse(minKmCtl.text.replaceAll(',', '.')) ?? 0,
+        'maxKm': double.tryParse(maxKmCtl.text.replaceAll(',', '.')) ?? 3,
+        'deliveryFee': double.tryParse(feeCtl.text.replaceAll(',', '.')) ?? 0,
+        'minOrderAmount': double.tryParse(minOrdCtl.text.replaceAll(',', '.')) ?? 0,
+      });
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _createPromo() async {
+    final codeCtl = TextEditingController();
+    final valCtl = TextEditingController(text: '10');
+    final minOrdCtl = TextEditingController(text: '15');
+    var type = 'PERCENTAGE';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => StatefulBuilder(
+        builder: (d, setD) => AlertDialog(
+          title: const Text('Nuevo código promocional'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(controller: codeCtl, decoration: const InputDecoration(labelText: 'Código (ej.: BIENVENIDA)')),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                value: type,
+                decoration: const InputDecoration(labelText: 'Tipo de descuento'),
+                items: const [
+                  DropdownMenuItem(value: 'PERCENTAGE', child: Text('Porcentaje (%)')),
+                  DropdownMenuItem(value: 'FIXED_AMOUNT', child: Text('Importe fijo (€)')),
+                ],
+                onChanged: (v) => setD(() => type = v ?? 'PERCENTAGE'),
+              ),
+              TextField(controller: valCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Valor del descuento')),
+              TextField(controller: minOrdCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Pedido mínimo (€)')),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Cancelar')),
+            FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('Guardar')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || codeCtl.text.trim().isEmpty) return;
+    try {
+      await Api.post('/staff/promos', {
+        'code': codeCtl.text.trim().toUpperCase(),
+        'discountType': type,
+        'discountValue': double.tryParse(valCtl.text.replaceAll(',', '.')) ?? 10,
+        'minOrderAmount': double.tryParse(minOrdCtl.text.replaceAll(',', '.')) ?? 0,
+      });
+      await _load();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final a = analytics;
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(padding: const EdgeInsets.all(12), children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Analíticas del día (desde las 02:00)', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              if (a == null)
+                const LinearProgressIndicator()
+              else ...[
+                Text('Facturación bruta: ${eur(a['grossRevenue'])} (${a['orderCount']} pedidos)',
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                Text('Base imponible neta: ${eur(a['netAmount'])} · IVA: ${eur(a['vatAmount'])}'),
+                Text('Ticket medio: ${eur(a['averageTicket'])}'),
+                Text('Efectivo: ${eur(a['cashTotal'])} (${a['cashCount']}) · Tarjeta: ${eur(a['cardTotal'])} (${a['cardCount']})'),
+                Text('T. medio cocina: ${a['avgPrepMinutes']} min · T. medio entrega: ${a['avgDeliveryMinutes']} min'),
+                if (((a['topProducts'] as List?) ?? []).isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  const Text('Top productos:', style: TextStyle(fontWeight: FontWeight.w600)),
+                  for (final p in (a['topProducts'] as List).cast<Map>())
+                    Text('  • ${p['quantity']}× ${p['name']} (${eur(p['revenue'])})'),
+                ],
+                if (((a['deliveriesByRider'] as List?) ?? []).isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  const Text('Entregas por repartidor:', style: TextStyle(fontWeight: FontWeight.w600)),
+                  for (final r in (a['deliveriesByRider'] as List).cast<Map>())
+                    Text('  • ${r['name']}: ${r['deliveries']}'),
+                ],
+              ],
+            ]),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Datos fiscales (Factura Simplificada / Veri*factu)', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              TextField(controller: legalCtl, decoration: const InputDecoration(labelText: 'Razón social')),
+              TextField(controller: nifCtl, decoration: const InputDecoration(labelText: 'NIF / CIF')),
+              TextField(controller: fiscalAddrCtl, decoration: const InputDecoration(labelText: 'Dirección fiscal')),
+              TextField(controller: vatCtl, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'IVA por defecto (%)')),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Imprimir doble ticket (Cocina + Cliente) en CloudPRNT'),
+                value: printReceipt,
+                onChanged: (v) => setState(() => printReceipt = v),
+              ),
+              FilledButton(
+                onPressed: savingFiscal ? null : _saveFiscal,
+                child: Text(savingFiscal ? 'Guardando…' : 'Guardar configuración fiscal'),
+              ),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(child: Text('Zonas de reparto', style: Theme.of(context).textTheme.titleMedium)),
+                FilledButton.tonalIcon(icon: const Icon(Icons.add, size: 18), label: const Text('Zona'), onPressed: _createZone),
+              ]),
+              if (zones.isEmpty) const Text('Sin zonas configuradas (tarifa base del restaurante).'),
+              for (final z in zones.cast<Map>())
+                ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text('${z['name']} (${z['minKm']}–${z['maxKm']} km)'),
+                  subtitle: Text('Envío: ${eur(z['deliveryFee'])} · Pedido mín.: ${eur(z['minOrderAmount'])}'),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: () async {
+                      await Api.delete('/staff/zones/${z['id']}');
+                      _load();
+                    },
+                  ),
+                ),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(child: Text('Códigos promocionales', style: Theme.of(context).textTheme.titleMedium)),
+                FilledButton.tonalIcon(icon: const Icon(Icons.add, size: 18), label: const Text('Cupón'), onPressed: _createPromo),
+              ]),
+              if (promos.isEmpty) const Text('Sin códigos promocionales activos.'),
+              for (final p in promos.cast<Map>())
+                ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text('${p['code']} · ${p['discountType'] == 'PERCENTAGE' ? '${p['discountValue']}%' : eur(p['discountValue'])}'),
+                  subtitle: Text('Mínimo: ${eur(p['minOrderAmount'])} · Usos: ${p['usesCount'] ?? 0}'),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: () async {
+                      await Api.delete('/staff/promos/${p['id']}');
+                      _load();
+                    },
+                  ),
+                ),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
 }
