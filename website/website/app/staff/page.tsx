@@ -19,6 +19,7 @@ const L10N: Record<Lang, Record<string, string>> = {
     "status.AVAILABLE": "Disponible en el restaurante",
     "status.DELIVERING": "Repartiendo",
     "status.COMING_BACK": "Volviendo al restaurante",
+    "status.SETTLING": "Turno cerrado — Pendiente de cuadrar caja",
     noShift: "Sin turno abierto. Espera a que el jefe abra tu turno.",
     noOrders: "No tienes pedidos asignados",
     myOrders: "Mis pedidos",
@@ -81,6 +82,7 @@ const L10N: Record<Lang, Record<string, string>> = {
     "status.AVAILABLE": "Available at the restaurant",
     "status.DELIVERING": "Delivering",
     "status.COMING_BACK": "Coming back to the restaurant",
+    "status.SETTLING": "Shift closed — Waiting for cash settlement",
     noShift: "No open shift. Wait for the jefe to open your shift.",
     noOrders: "You have no assigned orders",
     myOrders: "My orders",
@@ -160,7 +162,7 @@ const hhmm = (iso?: string | null) => {
 };
 
 const riderStatusEs = (s: string, active: number) =>
-  s === "AVAILABLE" ? "disponible" : s === "DELIVERING" ? `repartiendo (${active})` : s === "COMING_BACK" ? "volviendo" : "fuera de turno";
+  s === "AVAILABLE" ? "disponible" : s === "DELIVERING" ? `repartiendo (${active})` : s === "COMING_BACK" ? "volviendo" : s === "SETTLING" ? "pendiente de cuadrar caja" : "fuera de turno";
 
 export default function StaffAppPage() {
   const [token, setToken] = useState<string | null>(null);
@@ -1059,6 +1061,14 @@ export default function StaffAppPage() {
                       >
                         Abrir turno
                       </button>
+                    ) : live.status === "SETTLING" ? (
+                      <button
+                        type="button"
+                        style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid var(--accent)", background: "transparent", color: "var(--accent)", fontWeight: 600, cursor: "pointer" }}
+                        onClick={() => setJefeTab("caja")}
+                      >
+                        Ir a Caja (pendiente de cuadrar)
+                      </button>
                     ) : (
                       <button
                         type="button"
@@ -1429,8 +1439,8 @@ export default function StaffAppPage() {
                 <>
                   <strong>Asignar repartidor · #{modal.order.number}</strong>
                   <div style={{ display: "flex", flexDirection: "column", gap: 8, margin: "12px 0" }}>
-                    {liveRiders.riders.length === 0 && <p className="muted">Ningún repartidor con turno abierto</p>}
-                    {liveRiders.riders.map((r: any) => (
+                    {liveRiders.riders.filter((r: any) => r.status !== "SETTLING").length === 0 && <p className="muted">Ningún repartidor disponible con turno abierto</p>}
+                    {liveRiders.riders.filter((r: any) => r.status !== "SETTLING").map((r: any) => (
                       <button
                         key={r.id}
                         type="button"

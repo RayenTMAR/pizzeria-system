@@ -228,6 +228,8 @@ class _RiderHomeState extends State<RiderHome> with Polling {
         return Colors.orange.shade100;
       case 'COMING_BACK':
         return Colors.blue.shade100;
+      case 'SETTLING':
+        return Colors.amber.shade100;
       default:
         return Colors.grey.shade300;
     }

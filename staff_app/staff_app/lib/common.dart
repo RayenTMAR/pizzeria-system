@@ -39,6 +39,8 @@ String riderStatusEs(String s, int active) {
       return 'repartiendo ($active)';
     case 'COMING_BACK':
       return 'volviendo';
+    case 'SETTLING':
+      return 'pendiente de cuadrar caja';
     default:
       return 'fuera de turno';
   }

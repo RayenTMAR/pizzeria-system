@@ -58,6 +58,17 @@ const activeCount = (userId: string, restaurantId: string, excludeOrderId?: stri
 const openShift = (userId: string, restaurantId: string) =>
   prisma.shift.findFirst({ where: { userId, restaurantId, endedAt: null } });
 
+/** Current active or unsettled (not BALANCED) shift visible to the rider and Jefe roster. */
+const currentRiderShift = (userId: string, restaurantId: string) =>
+  prisma.shift.findFirst({
+    where: {
+      userId,
+      restaurantId,
+      OR: [{ endedAt: null }, { settlement: { not: "BALANCED" } }],
+    },
+    orderBy: { startedAt: "desc" },
+  });
+
 /** When a rider has no orders left on his trip he is "coming back". */
 async function refreshRider(userId: string, restaurantId: string) {
   const shift = await openShift(userId, restaurantId);
@@ -66,8 +77,8 @@ async function refreshRider(userId: string, restaurantId: string) {
     await prisma.shift.update({ where: { id: shift.id }, data: { comingBack: true } });
 }
 
-const riderStatus = (shift: { comingBack: boolean }, active: number) =>
-  active > 0 ? "DELIVERING" : shift.comingBack ? "COMING_BACK" : "AVAILABLE";
+const riderStatus = (shift: { comingBack: boolean; endedAt?: Date | null }, active: number) =>
+  shift.endedAt ? "SETTLING" : active > 0 ? "DELIVERING" : shift.comingBack ? "COMING_BACK" : "AVAILABLE";
 
 /** Optimizes stopNumber (1..N) across a rider's active ON_THE_WAY orders. */
 async function optimizeRiderStops(restaurantId: string, repartidorId: string): Promise<string[]> {
@@ -358,14 +369,24 @@ staff.patch("/staff/riders/me/location", requireRole("REPARTIDOR"), async (req, 
 });
 
 // ---------- Riders and the queue ----------
-/** Riders on shift with live status. `suggested` = waited longest (first in, first out). */
+/** Riders on shift (or closed awaiting Cuadrado) with live status. `suggested` = waited longest (FIFO). */
 staff.get("/riders", requireRole("JEFE"), async (req, res) => {
   const shifts = await prisma.shift.findMany({
-    where: { restaurantId: rid(req), endedAt: null },
+    where: {
+      restaurantId: rid(req),
+      OR: [{ endedAt: null }, { settlement: { not: "BALANCED" } }],
+    },
     include: { user: { select: { id: true, name: true } } },
+    orderBy: { startedAt: "desc" },
+  });
+  const seenRiders = new Set<string>();
+  const latestShifts = shifts.filter((s) => {
+    if (seenRiders.has(s.userId)) return false;
+    seenRiders.add(s.userId);
+    return true;
   });
   const riders = await Promise.all(
-    shifts.map(async (s) => {
+    latestShifts.map(async (s) => {
       const active = await activeCount(s.userId, rid(req));
       return {
         id: s.user.id,
@@ -383,9 +404,9 @@ staff.get("/riders", requireRole("JEFE"), async (req, res) => {
   res.json({ riders, suggestedRiderId: queue[0]?.id ?? null });
 });
 
-/** Rider's own state: shift on/off and status (shown in the profile screen). */
+/** Rider's own state: shift on/off (stays on until BALANCED) and status. */
 staff.get("/me/shift", requireRole("REPARTIDOR"), async (req, res) => {
-  const s = await openShift(req.user!.id, rid(req));
+  const s = await currentRiderShift(req.user!.id, rid(req));
   if (!s) return res.json({ onShift: false });
   const active = await activeCount(req.user!.id, rid(req));
   res.json({ onShift: true, since: s.startedAt, status: riderStatus(s, active) });
@@ -413,7 +434,7 @@ staff.post("/shifts/open", requireRole("JEFE"), async (req, res) => {
     where: { id: userId, restaurantId: rid(req), role: "REPARTIDOR", active: true },
   });
   if (!rider) throw new OrderError("NOT_FOUND", 404);
-  if (await openShift(userId, rid(req))) throw new OrderError("SHIFT_ALREADY_OPEN");
+  if (await currentRiderShift(userId, rid(req))) throw new OrderError("SHIFT_ALREADY_OPEN");
   // Opens as available: joins the queue straight away.
   res.status(201).json(
     await prisma.shift.create({
@@ -532,9 +553,9 @@ staff.get("/shifts/:id/summary", requireRole("JEFE"), async (req, res) => {
   res.json(await shiftSummary(s, rid(req)));
 });
 
-/** Repartidor: summary of his current shift (no settlement info). */
+/** Repartidor: summary of his current (or closed awaiting Cuadrado) shift (no settlement info). */
 staff.get("/me/summary", requireRole("REPARTIDOR"), async (req, res) => {
-  const s = await openShift(req.user!.id, rid(req));
+  const s = await currentRiderShift(req.user!.id, rid(req));
   if (!s) throw new OrderError("NOT_ON_SHIFT");
   res.json(await shiftSummary(s, rid(req)));
 });

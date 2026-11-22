@@ -202,7 +202,7 @@ class _OrdersTabState extends State<OrdersTab> with Polling, AutomaticKeepAliveC
   Future<void> _assign(Map o) async {
     try {
       final r = await Api.get('/riders');
-      final riders = (r['riders'] as List).cast<Map>();
+      final riders = (r['riders'] as List).cast<Map>().where((x) => x['status'] != 'SETTLING').toList();
       final suggested = r['suggestedRiderId'];
       if (!mounted) return;
       if (riders.isEmpty) {
@@ -684,7 +684,12 @@ class _RidersTabState extends State<RidersTab> with Polling {
                 ),
                 live[r['id']] == null
                     ? FilledButton(onPressed: () => _open(r), child: const Text('Abrir turno'))
-                    : OutlinedButton(onPressed: () => _close(live[r['id']]!), child: const Text('Cerrar turno')),
+                    : live[r['id']]!['status'] == 'SETTLING'
+                        ? OutlinedButton(
+                            onPressed: () => DefaultTabController.of(context).animateTo(2),
+                            child: const Text('Cuadrar en Caja'),
+                          )
+                        : OutlinedButton(onPressed: () => _close(live[r['id']]!), child: const Text('Cerrar turno')),
               ]),
             ),
           if (all.isEmpty) const Padding(padding: EdgeInsets.all(32), child: Center(child: Text('Sin repartidores'))),
