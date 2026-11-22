@@ -1,0 +1,282 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  JEFE
+  REPARTIDOR
+}
+enum OrderStatus {
+  NEW
+  IN_KITCHEN
+  READY
+  ON_THE_WAY
+  DELIVERED
+  CANCELLED
+}
+enum OrderSource {
+  WEB
+  MANUAL
+}
+enum PaymentMethod {
+  CASH
+  CARD
+}
+enum Settlement {
+  PENDING
+  BALANCED
+  DIFFERENCE
+}
+
+// ---------- Tenant (one row per restaurant) ----------
+model Restaurant {
+  id         String              @id @default(uuid())
+  name       String
+  slug       String              @unique
+  timezone   String              @default("Europe/Madrid")
+  active     Boolean             @default(true)
+  settings   RestaurantSettings?
+  hours      OpeningHour[]
+  printers   Printer[]
+  users      User[]
+  categories Category[]
+  products   Product[]
+  orders     Order[]
+  shifts     Shift[]
+  clients    Client[]
+}
+
+model RestaurantSettings {
+  restaurantId           String     @id
+  restaurant             Restaurant @relation(fields: [restaurantId], references: [id])
+  city                   String     @default("León") // appended to addresses for geocoding
+  lat                    Float
+  lng                    Float
+  maxRadiusKm            Float      @default(10) // road distance limit
+  prepMinutes            Int        @default(0)  // added to the delivery estimate for the cutoff rule
+  graceMinutesAfterClose Int        @default(20) // riders' limit after closing
+  dayResetHour           Int        @default(2)
+  dropoffBufferMinutes   Int        @default(2)
+  minOrder               Decimal?   @db.Decimal(8, 2)
+  deliveryFee            Decimal    @default(0) @db.Decimal(8, 2)
+}
+
+model OpeningHour {
+  id           String     @id @default(uuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  weekday      Int        // 0 = Sunday ... 6 = Saturday
+  openMin      Int        // minutes from midnight, e.g. 13:00 = 780
+  closeMin     Int        // up to 1440 (= midnight)
+
+  @@index([restaurantId, weekday])
+}
+
+model Printer {
+  id           String     @id @default(uuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  name         String
+  token        String     @unique // secret used in the printer's poll URL
+  active       Boolean    @default(true)
+  lastSeenAt   DateTime?
+}
+
+// ---------- People ----------
+model User {
+  id             String        @id @default(uuid())
+  restaurantId   String?       // null only for OWNER (platform owner)
+  restaurant     Restaurant?   @relation(fields: [restaurantId], references: [id])
+  role           Role
+  name           String
+  email          String        @unique
+  phone          String?
+  documentNumber String?       // DNI, NIE or passport number
+  passwordHash   String
+  language       String        @default("es")
+  active         Boolean       @default(true)
+  shifts         Shift[]
+  orders         Order[]       @relation("RiderOrders")
+  devices        DeviceToken[]
+  ratings        Rating[]      @relation("RiderRatings")
+}
+
+// ---------- Menu ----------
+model Category {
+  id           String     @id @default(uuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  name         String
+  position     Int        @default(0)
+  products     Product[]
+}
+
+model Product {
+  id           String      @id @default(uuid())
+  restaurantId String
+  restaurant   Restaurant  @relation(fields: [restaurantId], references: [id])
+  categoryId   String?
+  category     Category?   @relation(fields: [categoryId], references: [id])
+  name         String
+  description  String?
+  price        Decimal     @db.Decimal(8, 2)
+  available    Boolean     @default(true)
+  items        OrderItem[]
+
+  @@index([restaurantId])
+}
+
+// ---------- Orders ----------
+model Order {
+  id            String        @id @default(uuid())
+  restaurantId  String
+  restaurant    Restaurant    @relation(fields: [restaurantId], references: [id])
+  number        Int           // per-restaurant sequence shown on the ticket
+  status        OrderStatus   @default(IN_KITCHEN) // auto-accepted
+  source        OrderSource
+  trackingToken String        @unique @default(uuid())
+  clientName    String
+  clientPhone   String
+  streetType    String        // calle, avenida...
+  streetName    String
+  streetNumber  String
+  postalCode    String
+  floor         String?
+  door          String?
+  notes         String?
+  distanceKm    Float
+  etaMinutes    Int
+  total         Decimal       @db.Decimal(8, 2)
+  paymentMethod PaymentMethod
+  cashAmount    Decimal?      @db.Decimal(8, 2) // what the client will pay with
+  cancelReason  String?
+  cancelledById String?
+  clientId      String?
+  client        Client?       @relation(fields: [clientId], references: [id])
+  repartidorId  String?
+  repartidor    User?         @relation("RiderOrders", fields: [repartidorId], references: [id])
+  stopNumber    Int?
+  printedAt     DateTime?
+  createdAt     DateTime      @default(now())
+  deliveredAt   DateTime?
+  items         OrderItem[]
+  events        OrderEvent[]
+  rating        Rating?
+
+  @@unique([restaurantId, number])
+  @@index([restaurantId, createdAt])
+  @@index([repartidorId, status])
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  name      String  // snapshot
+  unitPrice Decimal @db.Decimal(8, 2) // snapshot
+  quantity  Int
+  note      String?
+}
+
+model OrderEvent {
+  id        String   @id @default(uuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actorId   String?
+  type      String   // CREATED, PRINTED, READY, ASSIGNED, REASSIGNED, DELIVERED, CANCELLED, ADDRESS_EDITED
+  data      Json?
+  createdAt DateTime @default(now())
+}
+
+// ---------- Shifts ----------
+model Shift {
+  id             String     @id @default(uuid())
+  restaurantId   String
+  restaurant     Restaurant @relation(fields: [restaurantId], references: [id])
+  userId         String
+  user           User       @relation(fields: [userId], references: [id])
+  startedAt      DateTime   @default(now())
+  endedAt        DateTime?
+  changeGiven    Decimal    @default(0) @db.Decimal(8, 2)
+  availableSince DateTime?  // queue position (first in, first out)
+  comingBack     Boolean    @default(false)
+  settlement     Settlement @default(PENDING)
+  difference     Decimal?   @db.Decimal(8, 2)
+  settlementNote String?
+
+  @@index([restaurantId, endedAt])
+}
+
+// ---------- Push notifications (FCM device tokens) ----------
+model DeviceToken {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  restaurantId String
+  token        String   @unique
+  platform     String   // android | ios
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------- Ratings (client, after delivery; visible to all staff) ----------
+model Rating {
+  id           String   @id @default(uuid())
+  restaurantId String
+  orderId      String   @unique
+  order        Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  repartidorId String?
+  repartidor   User?    @relation("RiderRatings", fields: [repartidorId], references: [id])
+  score        Int      // 1 to 5
+  comment      String?
+  createdAt    DateTime @default(now())
+
+  @@index([restaurantId, createdAt])
+}
+
+// ---------- Client Accounts (per restaurant) ----------
+model Client {
+  id           String     @id @default(uuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  name         String
+  email        String
+  phone        String
+  passwordHash String
+  streetType   String     @default("calle")
+  streetName   String     @default("")
+  streetNumber String     @default("")
+  postalCode   String     @default("")
+  floor        String?
+  door         String?
+  notes        String?
+  createdAt    DateTime   @default(now())
+  orders       Order[]
+
+  @@unique([restaurantId, email])
+}
+
+// ---------- Messaging (Private: Jefe<->Repartidor, Jefe<->Client, Repartidor<->Client) ----------
+model ChatMessage {
+  id           String   @id @default(uuid())
+  restaurantId String
+  channel      String   @default("STAFF") // STAFF | JEFE_CLIENT | RIDER_CLIENT
+  repartidorId String?  // set for STAFF (Jefe <-> Repartidor) thread
+  orderId      String?  // set for JEFE_CLIENT or RIDER_CLIENT thread on an order
+  senderRole   String   // JEFE | REPARTIDOR | CLIENT
+  senderName   String
+  text         String
+  createdAt    DateTime @default(now())
+
+  @@index([restaurantId, channel, repartidorId, createdAt])
+  @@index([orderId, channel, createdAt])
+}

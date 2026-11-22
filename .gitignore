@@ -1,0 +1,17 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies & build outputs
+node_modules/
+.next/
+dist/
+build/
+.dart_tool/
+
+# OS / IDE / tooling
+.DS_Store
+Thumbs.db
+.freebuff/
+*.tsbuildinfo
